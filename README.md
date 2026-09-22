@@ -33,14 +33,6 @@ I used the anemone version
 ```
 git clone https://github.com/anoane/exllamav3-anemone
 ```
-
-## Download exllama 
-
-I used the anemone version
-
-```
-git clone https://github.com/anoane/exllamav3-anemone
-```
 Building it
 
 ```
