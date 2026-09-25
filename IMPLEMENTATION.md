@@ -136,7 +136,32 @@ up to 5 times with exponential backoff (2 s, 4 s, 8 s, 16 s) on
 `429`/`500`/`502`/`503`/`504`/`529` and on connection failures, so a model reload no longer kills a
 request. A non-retryable status is returned to the client unchanged.
 
-### 2.6 Self-test
+### 2.6 Token usage and `stream_options`
+
+Upstream TabbyAPI reports token counts only when the request sets
+`stream_options.include_usage`, and it reports them in a final usage-only chunk whose `choices`
+list is empty. The proxy used to drop `stream_options` whenever `tools` were present, on the
+reasoning that the synthesised stream made upstream accounting moot. It does not: usage is
+upstream's accounting for the turn, not part of the SSE framing, so discarding it left every
+client showing `0 / 0` tokens for tool-bearing requests — `/stats` in Qwen Code, and the token
+counters in OpenWebUI.
+
+The tool path now keeps `stream_options` and forces `include_usage` on when the client has not
+asked for it, so the counts do not depend on what the client happened to send. The usage object
+from upstream is captured and re-emitted unchanged as a terminal chunk before `[DONE]`, in the
+same shape OpenAI and ollama use:
+
+```
+data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", …,
+       "choices": [], "usage": {"prompt_tokens": 217, "completion_tokens": 58, "total_tokens": 275}}
+data: [DONE]
+```
+
+TabbyAPI enriches that object with `prompt_time`, `prompt_tokens_per_sec` and acceptance counts;
+it is forwarded verbatim rather than normalised, so those survive for clients that want them.
+Requests without `tools` take the pass-through path and have always received usage unchanged.
+
+### 2.7 Self-test
 
 The parser ships with fixtures for every dialect above, plus fixtures for the streaming hold-back
 window. Run it after any change to the parser:

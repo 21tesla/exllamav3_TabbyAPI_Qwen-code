@@ -681,6 +681,23 @@ def _sse_chunk(resp_id: str, created: int, model: str, index: int, delta: dict, 
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _sse_usage_chunk(resp_id: str, created: int, model: str, usage: dict) -> str:
+    """Terminal usage-only chunk, sent just before [DONE].
+
+    Carries an empty choices list, matching what OpenAI and ollama emit for
+    `stream_options.include_usage`; the client reads the counts from here.
+    """
+    payload = {
+        "id": resp_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": usage,
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 def _unstreamed_remainder(parsed: Optional[str], raw: str, sent: int, field: str) -> str:
     """The part of a parsed field that incremental streaming has not delivered yet."""
     spoken = raw[:sent]
@@ -715,6 +732,7 @@ async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient,
     role_sent = False
     finish_reason = "stop"
     eos_reason = None
+    usage = None
 
     try:
         async for line in response.aiter_lines():
@@ -728,6 +746,9 @@ async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient,
                 event = json.loads(payload)
             except Exception:
                 continue
+
+            if isinstance(event.get("usage"), dict):
+                usage = event["usage"]
 
             for event_choice in event.get("choices", []):
                 if event_choice.get("finish_reason"):
@@ -798,6 +819,8 @@ async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient,
         logger.warning(f"Upstream produced an empty completion (finish_reason={choice.get('finish_reason')!r}, eos_reason={eos_reason!r})")
 
     yield _sse_chunk(resp_id, created, model, index, {}, choice.get("finish_reason", finish_reason))
+    if usage:
+        yield _sse_usage_chunk(resp_id, created, model, usage)
     yield "data: [DONE]\n\n"
 
 
@@ -871,8 +894,14 @@ async def chat_completions_proxy(request: Request):
         stream_body = dict(patched_body)
         stream_body["stream"] = True
         if has_tools:
-            # The proxy synthesises its own stream, so upstream usage accounting is moot.
-            stream_body.pop("stream_options", None)
+            # The proxy synthesises the SSE framing, but usage is upstream's
+            # accounting for the turn and survives it: keep include_usage on so
+            # the counts are available when the intercepted calls are emitted.
+            opts = stream_body.get("stream_options")
+            if not isinstance(opts, dict):
+                opts = {}
+            opts.setdefault("include_usage", True)
+            stream_body["stream_options"] = opts
 
         try:
             stream_ctx, response = await open_upstream_stream(client, url, stream_body, headers)
