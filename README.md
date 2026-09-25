@@ -15,6 +15,18 @@ Qwen Code CLI communicates with TabbyAPI via a lightweight FastAPI proxy. This p
 └──────────────┘     └──────────────┘     └──────────────┘
 ```
 
+`install.sh` performs every step below in order, and is idempotent — re-running it is the intended
+way to repair a machine whose TabbyAPI container did not come back after a reboot:
+
+```bash
+./install.sh                    # all steps
+./install.sh tabby proxy        # just those two: the usual post-reboot repair
+./install.sh --help
+```
+
+It takes the same values as environment overrides (`MODELS_DIR`, `CONFIG_DIR`, `TABBY_API_KEY`,
+...). The rest of this document explains what each step does and why.
+
 ---
 
 ## Download the model 
@@ -118,55 +130,43 @@ When Qwen Code CLI registers built-in tools (such as `get_goal` or `list_agents`
 ###  Solution
 A pre-validation block was written the exllamav3 directory, in my case, it was`/home/logan/software/exllamav3-anemone/tabby_proxy.py`. The `patch_tools_schema`  intercepts and supplies a default empty schema parameter object.
 
-### Add a system service
-`tabby-proxy.service` in this repository assumes the checkout lives at
-`/home/logan/software/exllamav3-anemone` and runs as `logan`; change `User=` and
-the two paths if yours differs.
+### Install the proxy service
 
-Use absolute paths rather than `%h`. In a **system** unit `%h` expands to the
-*system manager's* home (`/root`), not to the `User=`'s home, so a `%h`-based
-`ExecStart` fails to start with `status=203/EXEC`. `%h` only means "your home"
-in a `systemctl --user` unit.
+The proxy ships as `tabby-proxy@.service`, a **user** unit template, and that is the only
+supported install path. It runs under `systemctl --user`, where `%h` means *your* home, and it
+needs no sudo.
 
-```
-sudo cp tabby-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now tabby-proxy.service
-```
-
-An install helper is included, which refuses a unit that uses `%h` in an active
-directive, backs up whatever is deployed, and checks that systemd resolved the
-paths outside `/root` before it restarts the service:
+The instance name is the **path-encoded home directory**, not the username:
 
 ```bash
-./install-tabby-proxy-service.sh
+home=$(systemd-escape --path "$HOME")                          # -> home-logan
+systemctl --user daemon-reload
+install -Dm644 tabby-proxy@.service ~/.config/systemd/user/tabby-proxy@.service
+systemctl --user enable --now "tabby-proxy@$home.service"      # instance: tabby-proxy@home-logan.service
+systemctl --user status "tabby-proxy@$home.service"
+journalctl --user -u "tabby-proxy@$home.service" -f
 ```
 
-For a machine-agnostic unit, see `tabby-proxy@.service` below.
+The unit's `ExecStart` runs the proxy from the ExLlamaV3 checkout
+(`%h/software/exllamav3-anemone/tabby_proxy.py`), so that copy is the one that serves; keep it in
+step with the copy in this repository.
 
-The unit is:
+To reload after editing the proxy:
 
-```
-[Unit]
-Description=TabbyAPI Schema Guard Middleware Proxy
-After=network.target docker.service
-
-[Service]
-Type=simple
-User=logan
-WorkingDirectory=/home/logan/software/exllamav3-anemone
-ExecStart=/home/logan/software/exllamav3-anemone/venv/bin/python /home/logan/software/exllamav3-anemone/tabby_proxy.py
-Restart=always
-RestartSec=5
-Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-/home/logan/.config/tabby-proxy.env
-
-[Install]
-WantedBy=multi-user.target
+```bash
+systemctl --user restart "tabby-proxy@$home.service"
 ```
 
-The `EnvironmentFile` is optional and holds anything the unit cannot pick up
-from the client (see [Upstream API key](#upstream-api-key)):
+A user service is stopped at logout unless lingering is on, which is what lets it start at boot
+without you logging in:
+
+```bash
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" -p Linger
+```
+
+The optional `EnvironmentFile` holds anything the unit cannot pick up from the client (see
+[Upstream API key](#upstream-api-key)):
 
 ```
 # /home/logan/.config/tabby-proxy.env
@@ -174,40 +174,19 @@ TABBY_API_URL=http://127.0.0.1:5000
 TABBY_API_KEY=...
 ```
 
-`Restart=always` means the service also reloads itself after an edit without a
-password:
+#### Why not a system unit
 
-```bash
-kill $(systemctl show tabby-proxy.service -p MainPID --value)
-```
-
-### User-agnostic alternative: `tabby-proxy@.service`
-
-The template is the same service without absolute paths, instantiated per home
-directory. It runs under `systemd --user`, where `%h` *does* mean your home, and
-it needs no sudo. **Run one or the other** — both bind `127.0.0.1:8081`.
-
-```bash
-home=$(systemd-escape --path "$HOME")
-systemctl --user daemon-reload
-systemctl --user enable --now "tabby-proxy@$home.service"      # instance: tabby-proxy@home-logan.service
-systemctl --user status "tabby-proxy@$home.service"
-journalctl --user -u "tabby-proxy@$home.service" -f
-```
-
-If you switch from the system unit, disable it first or one of the two will
-crash-loop on the occupied port:
+An earlier revision of this repository shipped `tabby-proxy.service` as a **system** unit, to be
+copied into `/etc/systemd/system/` by an `install-tabby-proxy-service.sh` helper. Neither file is
+here any more, and the system route is not supported. In a system unit `%h` expands to the *system
+manager's* home (`/root`), not to the `User=`'s home, so a `%h`-based `ExecStart` failed to start
+with `status=203/EXEC`. The two units also both bind `127.0.0.1:8081`, so running both makes one
+crash-loop. If a system unit survives from an earlier install, remove it before starting the user
+instance:
 
 ```bash
 sudo systemctl disable --now tabby-proxy.service
-```
-
-A user service is stopped at logout unless lingering is on, which lets it start
-at boot without you logging in:
-
-```bash
-loginctl enable-linger "$USER"
-loginctl show-user "$USER" -p Linger
+sudo rm /etc/systemd/system/tabby-proxy.service
 ```
 
 ---
@@ -268,7 +247,7 @@ If a dialect still escapes it, the proxy logs
 dropping the call:
 
 ```bash
-journalctl -u tabby-proxy.service -f
+journalctl --user -u "tabby-proxy@$home.service" -f
 ```
 
 ### Self-test
@@ -276,7 +255,7 @@ The parser ships with fixtures for each dialect above, plus fixtures for the
 streaming hold-back window:
 
 ```bash
-./venv/bin/python tabby_proxy.py --selftest
+/home/logan/software/exllamav3-anemone/venv/bin/python tabby_proxy.py --selftest
 ```
 
 ### Upstream API key
