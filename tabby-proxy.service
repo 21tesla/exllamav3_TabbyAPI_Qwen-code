@@ -1,0 +1,15 @@
+[Unit]
+Description=TabbyAPI Schema Guard Middleware Proxy
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=logan
+WorkingDirectory=/home/logan/software/exllamav3-anemone
+ExecStart=/home/logan/software/exllamav3-anemone/venv/bin/python /home/logan/software/exllamav3-anemone/tabby_proxy.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
