@@ -58,30 +58,71 @@ TORCH_CUDA_ARCH_LIST="12.0" ./venv/bin/pip install -e . \
  --no-build-isolation
 
 ```
-## Obtain TabbyAPI 
-
-I needed to do this privileged
+## Obtain TabbyAPI
 
 ```
-sudo docker pull ghcr.io/theroyallab/tabbyapi:cu13
+docker pull ghcr.io/theroyallab/tabbyapi:cu13
 ```
 
+Neither the pull nor the service needs root: Docker runs in **rootless** mode here
+(`unix:///run/user/1000/docker.sock`), so plain `docker` reaches the daemon.
+
+If the pull answers **`denied: denied`**, the image is not private — a stored ghcr credential is
+being presented that cannot read it. `~/.docker/config.json` may hold an expired or scope-limited
+token for `ghcr.io`, and Docker will not fall back to anonymous access on its own. Verify that
+anonymity works, then pull without the credential:
+
+```bash
+curl -s "https://ghcr.io/token?scope=repository:theroyallab/tabbyapi:pull&service=ghcr.io"   # a token, not a denial
+mkdir -p /tmp/docker-nocreds && printf '{}' > /tmp/docker-nocreds/config.json
+DOCKER_CONFIG=/tmp/docker-nocreds docker pull ghcr.io/theroyallab/tabbyapi:cu13
+```
+
+`install.sh` does this automatically: it retries anonymously if the authenticated pull fails.
 
 ## Start TabbyAPI
 
-To run the local model server, start TabbyAPI with a Docker command: My installation was in ~/software/tabbyapi and my DeepSeek model was in ~/models
-
 ```bash
-sudo docker run --gpus all --shm-size=8g --name tabbyapi \
+docker run --gpus all --shm-size=8g --name tabbyapi \
   -d \
-  -p 5000:5000 \
+  -p 127.0.0.1:5000:5000 \
+  --entrypoint python3 \
   -v /home/logan/models:/app/models \
-  -v /home/logan/software/tabbyapi-config:/app/config \
+  -v /home/logan/software/tabbyapi-config/config.yml:/app/config.yml:ro \
+  -v /home/logan/software/tabbyapi-config/api_tokens.yml:/app/api_tokens.yml \
+  -v /home/logan/software/tabbyapi-config/sampler_overrides:/app/sampler_overrides:ro \
   --restart unless-stopped \
-  ghcr.io/theroyallab/tabbyapi:cu13
+  ghcr.io/theroyallab/tabbyapi:cu13 \
+  main.py --host 0.0.0.0
 ```
 
-* This commands exposes the local model directory (`~/models`) into TabbyAPI's workspace and uses port `5000`. Docker runs in the background and will restart if the system is rebooted.
+Every part of that command is load-bearing, and these are easy to get wrong in ways that fail
+*silently* rather than loudly:
+
+* **`config.yml` and `api_tokens.yml` are mounted as files, not as a directory.** TabbyAPI reads
+  `pathlib.Path("config.yml")` and `pathlib.Path("api_tokens.yml")` relative to its working
+  directory, and the image's own code lives in `/app` (`WORKDIR /app`, then `COPY . .`). Mounting a
+  directory at `/app` would shadow the application *and* hide the config from it — the container
+  would start on defaults with no error. `/app/sampler_overrides` is resolved the same relative
+  way, which is why the preset directory is mounted there.
+* **`api_tokens.yml` must be mounted, or your key changes without asking.** With no auth file at
+  `/app/api_tokens.yml`, TabbyAPI generates a fresh `token_hex(16)` at startup, writes it into the
+  container, and prints it to the log. Every request then fails `401` against the key in
+  `~/.qwen/settings.json`. It is mounted writable so that generation still works.
+* **`--host 0.0.0.0`.** The default is `127.0.0.1`, which inside a container is the container's own
+  loopback that `-p 5000:5000` cannot reach. Command-line arguments override `config.yml`, so this
+  and `network.host` must agree.
+* **`model_name` must be set in `config.yml`.** TabbyAPI only loads a model at startup when
+  `model.model_name` is present. With `model_dir` alone it starts an empty server that answers
+  every request with "no model loaded".
+* `--restart unless-stopped` is what brings the container back after a reboot. Without it the
+  container does not return, and nothing announces that.
+* The model directory is mounted read-only in effect (`~/models` → `/app/models`) and the server
+  listens on `5000`, bound to loopback so it is not exposed to the network.
+* No `--ulimit memlock=-1`, although upstream suggests it. Docker here is **rootless**, and an
+  unprivileged daemon cannot raise `RLIMIT_MEMLOCK`; passing it fails the container at OCI-create
+  time with `error setting rlimit type 8: operation not permitted`.
+
 
 ---
 

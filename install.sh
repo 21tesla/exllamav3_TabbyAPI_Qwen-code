@@ -156,16 +156,22 @@ step_serving() {
         grep -qxE '[[:space:]]*override_preset:[[:space:]]*deepseek_v4.*' "$cfg" \
             || warn "$cfg does not select override_preset: deepseek_v4"
     else
-        cat > "$cfg" <<'YAML'
+        cat > "$cfg" <<YAML
 # TabbyAPI configuration. Every value here has an application default; this file
 # only lists what is worth pinning.
 network:
-  host: 127.0.0.1
+  # 0.0.0.0, not the default 127.0.0.1. Inside a container the default binds its
+  # own loopback, which -p 5000:5000 cannot reach: the container looks healthy
+  # while every request fails to connect.
+  host: 0.0.0.0
   port: 5000
 
 model:
-  # Resolved inside the container, where the pack is mounted at /app/models.
+  # Both are resolved inside the container, where the pack is mounted at
+  # /app/models. model_name is what triggers the load at startup -- model_dir
+  # alone starts the server with no model, and every request then fails.
   model_dir: /app/models
+  model_name: $MODEL_NAME
 
 # The DeepSeek sampler recommendation, not TabbyAPI's safe_defaults. safe_defaults
 # would fill temperature 0.8 / min_p 0.05 into requests that omit samplers, and
@@ -178,8 +184,8 @@ YAML
     fi
 
     # sampler_overrides/deepseek_v4.yml. TabbyAPI resolves this path relative to
-    # its working directory (/app), so a copy inside the config mount is not
-    # found on its own; the proxy step copies it to /app/sampler_overrides.
+    # its working directory (/app), not to the config file, so it is mounted at
+    # /app/sampler_overrides rather than left here.
     local preset_src="$MODELS_DIR/$MODEL_NAME/serve/sampler_overrides/deepseek_v4.yml"
     if [ -f "$CONFIG_DIR/sampler_overrides/deepseek_v4.yml" ]; then
         echo "keeping existing $CONFIG_DIR/sampler_overrides/deepseek_v4.yml"
@@ -222,9 +228,21 @@ step_tabby() {
     have docker || die "docker is not installed"
     docker info >/dev/null 2>&1 || die "cannot talk to the docker daemon (is it running?)"
 
+    # The registry denies this pull when a stale ghcr credential is presented --
+    # a public package that reads fine anonymously answers "denied: denied" to a
+    # token without read:packages. So a failed authenticated pull is retried with
+    # an empty docker config, which makes docker use anonymous access. The
+    # fallback never touches the real ~/.docker/config.json.
     docker image inspect "$TABBY_IMAGE" >/dev/null 2>&1 || {
         echo "pulling $TABBY_IMAGE"
-        docker pull "$TABBY_IMAGE"
+        docker pull "$TABBY_IMAGE" || {
+            warn "authenticated pull failed; retrying anonymously"
+            local anon_cfg
+            anon_cfg="$(mktemp -d)"
+            printf '{}' > "$anon_cfg/config.json"
+            DOCKER_CONFIG="$anon_cfg" docker pull "$TABBY_IMAGE"
+            rm -rf "$anon_cfg"
+        }
     }
 
     # The published image ships upstream ExLlamaV3, which is sufficient for this
@@ -240,33 +258,51 @@ step_tabby() {
             docker start "$TABBY_CONTAINER"
         fi
     else
+        [ -f "$CONFIG_DIR/config.yml" ] || die "run the serving step first: $CONFIG_DIR/config.yml is missing"
+
         echo "creating $TABBY_CONTAINER"
+        # config.yml and api_tokens.yml are mounted as *files*, not as a
+        # directory. TabbyAPI reads pathlib.Path("config.yml") and
+        # pathlib.Path("api_tokens.yml") relative to its working directory
+        # (/app), and the image's own code lives in /app -- so mounting anything
+        # there as a directory would both shadow the application and hide the
+        # config from it.
+        #
+        # sampler_overrides is resolved the same relative way, so that one is a
+        # directory mount at /app/sampler_overrides, which the image does not use.
+        #
+        # api_tokens.yml is mounted as a file. Without it TabbyAPI finds no auth
+        # file, generates a fresh key inside the container and prints it to the
+        # log -- which silently invalidates the key in ~/.qwen/settings.json. It
+        # is writable so that generating a key still works, and persists.
+        #
+        # --host is passed to match network.host in config.yml. CLI arguments win
+        # over the file, so the two must agree or the port mapping silently breaks.
+        #
         # --shm-size is not optional: ExLlamaV3 keeps tensor-parallel and CPU MoE
         # handoff buffers in /dev/shm, where Docker's 64 MiB default fails.
         # --restart unless-stopped is what survives a reboot; a container run
         # without it is gone after the host comes back.
+        #
+        # No --ulimit flags. Upstream suggests memlock=-1, but rootless docker
+        # runs as an unprivileged user and cannot raise RLIMIT_MEMLOCK, so
+        # passing it fails the container at OCI-create time with
+        # "error setting rlimit type 8: operation not permitted".
         docker run --gpus all --shm-size=8g --name "$TABBY_CONTAINER" \
             -d \
             -p "127.0.0.1:$UPSTREAM_PORT:5000" \
+            --entrypoint python3 \
             -v "$MODELS_DIR:/app/models" \
-            -v "$CONFIG_DIR:/app/config" \
-            --ulimit memlock=-1 --ulimit nofile=1048576 \
+            -v "$CONFIG_DIR/config.yml:/app/config.yml:ro" \
+            -v "$CONFIG_DIR/api_tokens.yml:/app/api_tokens.yml" \
+            -v "$CONFIG_DIR/sampler_overrides:/app/sampler_overrides:ro" \
             --restart unless-stopped \
-            "$TABBY_IMAGE"
+            "$TABBY_IMAGE" \
+            main.py --host 0.0.0.0
     fi
 
-    # TabbyAPI looks for sampler_overrides relative to /app, not /app/config, so
-    # the preset is copied into the container even though config.yml is mounted.
-    if [ -f "$CONFIG_DIR/sampler_overrides/deepseek_v4.yml" ]; then
-        docker exec "$TABBY_CONTAINER" mkdir -p /app/sampler_overrides 2>/dev/null || true
-        docker cp "$CONFIG_DIR/sampler_overrides/deepseek_v4.yml" \
-            "$TABBY_CONTAINER:/app/sampler_overrides/deepseek_v4.yml" 2>/dev/null \
-            && echo "installed deepseek_v4 sampler preset in the container" \
-            || warn "could not copy the sampler preset into the container"
-    fi
-
-    echo "waiting for TabbyAPI to load $MODEL_NAME"
-    wait_for "http://127.0.0.1:$UPSTREAM_PORT/v1/models" "upstream :$UPSTREAM_PORT" 150 \
+    echo "waiting for TabbyAPI to load $MODEL_NAME (85 GB; several minutes)"
+    wait_for "http://127.0.0.1:$UPSTREAM_PORT/v1/models" "upstream :$UPSTREAM_PORT" 300 \
         || warn "TabbyAPI has not answered yet; see: docker logs -f $TABBY_CONTAINER"
 }
 
