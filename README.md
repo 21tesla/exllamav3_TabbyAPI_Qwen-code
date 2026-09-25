@@ -161,3 +161,66 @@ To verify everything is working end-to-end, run a quick headless command from th
 qwen --prompt "Solve 5 + 5"
 ```
 
+
+---
+
+## Tool Calling: DSML Interception
+
+### Problem
+With `tools` in the request, this ExLlama/TabbyAPI build answers
+`finish_reason: "tool_calls"` but leaves **`tool_calls: null`**. The model's tool
+call then exists only as DeepSeek **DSML text** inside `content` (or
+`reasoning_content`). A client that trusts `finish_reason` renders an empty
+assistant turn and the session stops with no error at all.
+
+### Solution
+The proxy injects the tool catalogue and the tool-call format into the system
+prompt, forces a non-streaming upstream call so complete responses can be
+intercepted, parses the tool call back out of the text, and re-emits the result
+as a valid OpenAI SSE stream carrying proper `tool_calls` deltas.
+
+The DSML the model emits is not stable between turns — this checkpoint uses at
+least four dialects, so the parser walks the tags instead of matching one regex:
+
+```
+<tool_call>
+<|DSML|tool name="read_file">            name attribute on the open tag
+<parameter name="file_path">p</parameter>
+</|DSML|tool>
+</tool_call>
+
+<tool_call>
+<|DSML| name="read_file">                no tag name, only the attribute
+<parameter name="file_path">p</parameter>
+</|DSML|>                                bare closing tags
+</|DSML|>
+</tool_call>
+
+<tool_call>
+<\uff5cDSML\uff5c name="read_file">      the bars arrive as escaped text
+...
+<tool_call>
+<|DSML|read_file>                        function name used as the tag name
+...
+```
+
+If a dialect still escapes it, the proxy logs
+`Tool-call syntax present but unparsed: ...` to the journal rather than silently
+dropping the call:
+
+```bash
+journalctl -u tabby-proxy.service -f
+```
+
+### Self-test
+The parser ships with fixtures for each dialect above:
+
+```bash
+./venv/bin/python tabby_proxy.py --selftest
+```
+
+### Upstream API key
+The proxy forwards the client's own `Authorization` / `x-api-key` header, so no
+key is stored in this repository or in the service unit. A client that sends no
+key receives `401` unless `TABBY_API_KEY` is exported in the service
+environment.
