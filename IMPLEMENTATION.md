@@ -161,10 +161,30 @@ TabbyAPI enriches that object with `prompt_time`, `prompt_tokens_per_sec` and ac
 it is forwarded verbatim rather than normalised, so those survive for clients that want them.
 Requests without `tools` take the pass-through path and have always received usage unchanged.
 
-### 2.7 Self-test
+### 2.7 A JSON tool call missing its closing brace
+
+Roughly once per long session the checkpoint ends a JSON tool call one character early: the outer
+argument object's `}` is absent, and the `</tool_call>` wrapper still follows it. The client sees
+a malformed call and aborts the turn with `InvalidStreamError: Model response contained a
+malformed tool call.`, so the whole turn is lost for the sake of one byte.
+
+Captured live (2026-09-25) as an `ask_user_question` call: 7 `{` against 6 `}`, balanced brackets,
+every brace outside a string, and `json.loads(value + "}")` parsing cleanly to a valid call.
+
+`repair_truncated_json()` handles this without loosening the parser generally. When `raw_decode`
+fails at a starting bracket, the parser asks it for a repair: string contents are removed so a `{`
+inside a description cannot skew the count, the brackets left open are collected as a stack, and
+those closers are appended in nesting order and re-parsed. Because the wrapper markup is not part
+of the value, a fragment whose last character is not a closer is first cut at its last structural
+character — never earlier, since truncating at an interior closer would silently drop part of the
+value. The repair only succeeds when the result parses, so prose containing a brace still yields
+no call, and the extracted call then goes through the same `normalize_tool_call_dict` validation
+as any other. At most `len(stack)` closers are tried, and each is tried once.
+
+### 2.8 Self-test
 
 The parser ships with fixtures for every dialect above, plus fixtures for the streaming hold-back
-window. Run it after any change to the parser:
+window and for the brace repair. Run it after any change to the parser:
 
 ```bash
 ~/software/exllamav3-anemone/venv/bin/python tabby_proxy.py --selftest
@@ -479,6 +499,40 @@ sudo rm /etc/systemd/system/tabby-proxy.service
 loopback too, so the address works either way. The model name must match the directory under
 `model_dir` exactly — inline loading is strict, and a misspelt name gets a `404`.
 
+The model's context window has to be declared on the **provider entry**, not in
+`model.generationConfig`:
+
+```json
+{
+  "id": "DeepSeek-V4-Flash-0731-exl3-2.32bpw",
+  "name": "DeepSeek-V4-Flash-0731-exl3-2.32bpw",
+  "baseUrl": "http://127.0.0.1:8081/v1",
+  "envKey": "OPENAI_API_KEY",
+  "generationConfig": { "contextWindowSize": 1048576 }
+}
+```
+
+The docs list `contextWindowSize` under `model.generationConfig`, with a caveat about provider
+models that reads as if it were specific to `enableRequestMetadata`. It is not: the setting is in
+`MODEL_GENERATION_CONFIG_FIELDS`, and when a matching provider entry exists Qwen Code assigns
+every field of that list from the entry unconditionally, overwriting the top-level copy rather
+than merging it. The top-level form is only merged on the manual-credentials path. So the provider
+entry is the effective placement, and a top-level `contextWindowSize` is silently ignored.
+
+Getting this wrong is quiet rather than loud: with nothing declared, Qwen Code falls back to
+`tokenLimit(modelId, "input")`, which for a model id it does not recognise — this one included —
+returns a flat **1000000**, not the pack's real **1048576**. `/stats` then reports against the
+wrong denominator. Verify the resolved window from the startup log:
+
+```bash
+node ~/.local/lib/qwen-code/lib/cli.js -m DeepSeek-V4-Flash-0731-exl3-2.32bpw -d -p "hi"
+grep -o 'contextLimit=[0-9]*' "$(ls -t ~/.qwen/debug/*.txt | head -1)"
+# contextLimit=1048576
+```
+
+`/v1/models` reports `n_ctx: null` for this upstream, so the client cannot infer the window from
+the model list and the declaration above is the only way to get it right.
+
 ### 7.2 OpenWebUI
 
 OpenWebUI is containerised, so it uses the host IP (`http://<host-ip>:8081/v1`) and the same key.
@@ -587,6 +641,9 @@ Each of these actually happened, and each is now handled or documented.
 | a variable in `tabby-proxy.env` had no effect | the unit was running a *different copy* of the proxy | unit repointed at this repo (§1) |
 | `000` from a container to `:5000` | a container has no route to the host's loopback | route container clients through the proxy (§6.3) |
 | `HTTP 401 Invalid API key` from the load/unload scripts | a hardcoded token had gone stale | key derived at runtime (§8) |
+| a turn dies with `malformed tool call` | the model ended the call's JSON one brace early | bounded brace repair before giving up (§2.7) |
+| `/stats` reports `0 / 0` tokens on tool turns | `stream_options` was dropped whenever tools were present | keep it, force `include_usage` (§2.6) |
+| context usage computed against 1000000 | the window was never declared, so a generic fallback was used | declare it on the provider entry (§7.1) |
 
 ---
 

@@ -409,6 +409,84 @@ def normalize_tool_call_dict(d: dict) -> Tuple[Optional[str], Any]:
     return name, args
 
 
+def _unescaped_structure(text: str) -> str:
+    """Drop string contents so brace counting only sees structural characters."""
+    out = []
+    in_str = False
+    escaped = False
+    for ch in text:
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+                out.append(ch)
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _open_structure(structural: str) -> List[str]:
+    """Open brackets that a structurally-only text leaves unclosed, outermost first."""
+    stack: List[str] = []
+    for ch in structural:
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+    return stack
+
+
+_CLOSER_FOR = {"{": "}", "[": "]"}
+
+
+def repair_truncated_json(text: str) -> Optional[Any]:
+    """Parse `text` as JSON, tolerating a JSON value cut short by a dropped closer.
+
+    The checkpoint occasionally emits a tool-call argument object with its outer
+    closing brace missing -- the stream ends one character early -- so
+    `raw_decode` fails on the very last delimiter. Appending missing closers (in
+    nesting order) recovers the call; string contents are ignored so a `{` inside
+    a description cannot fool the count. The value is typically followed by
+    wrapper markup (`</tool_call>`) that is not part of it, so the fragment is cut
+    at its last structural character first; no earlier cut is tried, since
+    truncating at an interior closer would silently drop part of the value.
+    Returns None when no bounded repair makes a value parse.
+    """
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    decoder = json.JSONDecoder()
+    cuts = [len(text)]
+    for pos in range(len(text) - 1, -1, -1):
+        if text[pos] in ("}", "]", '"'):
+            if pos + 1 != len(text):
+                cuts.append(pos + 1)
+            break
+
+    for cut in cuts:
+        fragment = text[:cut]
+        stack = _open_structure(_unescaped_structure(fragment))
+        remaining = [_CLOSER_FOR[opener] for opener in reversed(stack)]
+        while True:
+            try:
+                obj, _end = decoder.raw_decode(fragment + "".join(remaining))
+                return obj
+            except Exception:
+                if not remaining:
+                    break
+                remaining.pop()
+    return None
+
+
 def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str]]:
     """Robustly extracts tool calls from content in JSON, DSML, XML, or pseudo formats."""
     if not content:
@@ -479,22 +557,28 @@ def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str
         if ch in ("{", "["):
             try:
                 obj, end_pos = decoder.raw_decode(content, idx)
-                if isinstance(obj, list):
-                    for item in obj:
-                        if isinstance(item, dict):
-                            n, a = normalize_tool_call_dict(item)
-                            if n:
-                                add_call(n, a)
-                                first_start = min(first_start, idx)
-                elif isinstance(obj, dict):
-                    n, a = normalize_tool_call_dict(obj)
-                    if n:
-                        add_call(n, a)
-                        first_start = min(first_start, idx)
-                idx = end_pos
-                continue
             except Exception:
-                pass
+                # A closer may simply be absent from the tail of the value; try
+                # a bounded repair before giving up on this starting bracket.
+                repaired = repair_truncated_json(content[idx:])
+                if repaired is None:
+                    idx += 1
+                    continue
+                obj, end_pos = repaired, len(content)
+            if isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, dict):
+                        n, a = normalize_tool_call_dict(item)
+                        if n:
+                            add_call(n, a)
+                            first_start = min(first_start, idx)
+            elif isinstance(obj, dict):
+                n, a = normalize_tool_call_dict(obj)
+                if n:
+                    add_call(n, a)
+                    first_start = min(first_start, idx)
+            idx = end_pos
+            continue
         idx += 1
 
     # 3. XML function format <function=NAME>...
@@ -1004,6 +1088,23 @@ def _selftest_cases():
         "</tool_call>"
     )
     v3 = v1.replace(fw, "\\uff5c")
+    # The checkpoint occasionally drops the argument object's outer closing
+    # brace -- the stream ends one byte early -- and the wrapper markup still
+    # follows it. Captured verbatim from a live qwen-code session (2026-09-25)
+    # as an ask_user_question call; the brace count there was short by exactly
+    # one and every brace sat outside a string.
+    v4_args = (
+        '{"questions": [{"question": "Which example?", "header": "Type", '
+        '"options": [{"label": "GUI counter app", "description": "tkinter vs egui"}, '
+        '{"label": "CLI tool", "description": "wc in both languages"}]}]}'
+    )
+    v4 = (
+        "Sure, let me confirm what you want.\n\n"
+        "<tool_call>\n"
+        '{"name": "ask_user_question", "arguments": ' + v4_args + "\n"
+        "</tool_call>\n"
+        "</tool_call>"
+    )
     return [
         ("v1 name attribute + bare closes", v1, [("read_file", {"file_path": "/tmp/stage123.txt"})], "I'll read the brief for you."),
         (
@@ -1013,6 +1114,12 @@ def _selftest_cases():
             None,
         ),
         ("v3 escaped bars (\\uff5c)", v3, [("read_file", {"file_path": "/tmp/stage123.txt"})], "I'll read the brief for you."),
+        (
+            "v4 json missing one closing brace",
+            v4,
+            [("ask_user_question", json.loads(v4_args))],
+            "Sure, let me confirm what you want.",
+        ),
     ]
 
 
@@ -1087,7 +1194,26 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
-    total = len(cases) + len(marker_cases) + len(remainder_cases) + 1
+    repair_cases = [
+        ("missing brace", '{"a": 1', {"a": 1}),
+        ("missing bracket", '{"a": [1, 2', {"a": [1, 2]}),
+        ("missing both", '{"q": [{"l": "b"', {"q": [{"l": "b"}]}),
+        ("brace inside a string", '{"a": "x{y", "b": 2', {"a": "x{y", "b": 2}),
+        ("already complete", '{"a": 1}', {"a": 1}),
+        ("wrapper markup after value", '{"a": 1}\n</tool_call>', {"a": 1}),
+        ("wrapper plus missing brace", '{"a": {"b": 1}\n</tool_call>', {"a": {"b": 1}}),
+        ("trailing comma is not a closer", '{"a": 1,', None),
+        ("not json at all", '{"a": ,', None),
+    ]
+    for name, fragment, expected in repair_cases:
+        got = repair_truncated_json(fragment)
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} repair {name}: {got!r}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
+    total = len(cases) + len(marker_cases) + len(remainder_cases) + len(repair_cases) + 1
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
 
