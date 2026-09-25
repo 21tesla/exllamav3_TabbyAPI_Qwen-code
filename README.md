@@ -120,14 +120,26 @@ A pre-validation block was written the exllamav3 directory, in my case, it was`/
 
 ### Add a system service
 `tabby-proxy.service` in this repository assumes the checkout lives at
-`$HOME/software/exllamav3-anemone` and runs as `logan`; adjust those two values
-if yours differs. `%h` is the service user's home directory, so the same file
-works under any user once the paths match.
+`/home/logan/software/exllamav3-anemone` and runs as `logan`; change `User=` and
+the two paths if yours differs.
+
+Use absolute paths rather than `%h`. In a **system** unit `%h` expands to the
+*system manager's* home (`/root`), not to the `User=`'s home, so a `%h`-based
+`ExecStart` fails to start with `status=203/EXEC`. `%h` only means "your home"
+in a `systemctl --user` unit.
 
 ```
 sudo cp tabby-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now tabby-proxy.service
+```
+
+An install helper is included, which refuses a unit that uses `%h` in an active
+directive, backs up whatever is deployed, and checks that systemd resolved the
+paths outside `/root` before it restarts the service:
+
+```bash
+./install-tabby-proxy-service.sh
 ```
 
 The unit is:
@@ -140,12 +152,12 @@ After=network.target docker.service
 [Service]
 Type=simple
 User=logan
-WorkingDirectory=%h/software/exllamav3-anemone
-ExecStart=%h/software/exllamav3-anemone/venv/bin/python %h/software/exllamav3-anemone/tabby_proxy.py
+WorkingDirectory=/home/logan/software/exllamav3-anemone
+ExecStart=/home/logan/software/exllamav3-anemone/venv/bin/python /home/logan/software/exllamav3-anemone/tabby_proxy.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-%h/.config/tabby-proxy.env
+EnvironmentFile=-/home/logan/.config/tabby-proxy.env
 
 [Install]
 WantedBy=multi-user.target
@@ -155,7 +167,7 @@ The `EnvironmentFile` is optional and holds anything the unit cannot pick up
 from the client (see [Upstream API key](#upstream-api-key)):
 
 ```
-# ~/.config/tabby-proxy.env
+# /home/logan/.config/tabby-proxy.env
 TABBY_API_URL=http://127.0.0.1:5000
 TABBY_API_KEY=...
 ```
@@ -239,10 +251,10 @@ streaming hold-back window:
 The proxy forwards the client's own `Authorization` / `x-api-key` header, so no
 key is stored in this repository or in the service unit. A client that sends no
 key receives `401` unless `TABBY_API_KEY` is exported in the service
-environment, e.g. through `~/.config/tabby-proxy.env`:
+environment, e.g. through `/home/logan/.config/tabby-proxy.env`:
 
 ```
-# ~/.config/tabby-proxy.env
+# /home/logan/.config/tabby-proxy.env
 TABBY_API_URL=http://127.0.0.1:5000
 TABBY_API_KEY=...
 ```
