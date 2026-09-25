@@ -119,14 +119,20 @@ When Qwen Code CLI registers built-in tools (such as `get_goal` or `list_agents`
 A pre-validation block was written the exllamav3 directory, in my case, it was`/home/logan/software/exllamav3-anemone/tabby_proxy.py`. The `patch_tools_schema`  intercepts and supplies a default empty schema parameter object.
 
 ### Add a system service
-Create a new entry:
+`tabby-proxy.service` in this repository assumes the checkout lives at
+`$HOME/software/exllamav3-anemone` and runs as `logan`; adjust those two values
+if yours differs. `%h` is the service user's home directory, so the same file
+works under any user once the paths match.
 
 ```
-sudo nano /etc/systemd/system/tabby-proxy.service
+sudo cp tabby-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tabby-proxy.service
 ```
-Adjust the contents to reflect the location of exllamav3-anemone and the username
 
-```                                   
+The unit is:
+
+```
 [Unit]
 Description=TabbyAPI Schema Guard Middleware Proxy
 After=network.target docker.service
@@ -134,22 +140,31 @@ After=network.target docker.service
 [Service]
 Type=simple
 User=logan
-WorkingDirectory=/home/logan/software/exllamav3-anemone
-ExecStart=/home/logan/software/exllamav3-anemone/venv/bin/python /home/logan/software/exllamav3-anemone/tabby_proxy.py
+WorkingDirectory=%h/software/exllamav3-anemone
+ExecStart=%h/software/exllamav3-anemone/venv/bin/python %h/software/exllamav3-anemone/tabby_proxy.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/tabby-proxy.env
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Start the service
+The `EnvironmentFile` is optional and holds anything the unit cannot pick up
+from the client (see [Upstream API key](#upstream-api-key)):
 
 ```
-sudo systemctl daemon-reload
-sudo systemctl enable tabby-proxy.service
-sudo systemctl start tabby-proxy.service
+# ~/.config/tabby-proxy.env
+TABBY_API_URL=http://127.0.0.1:5000
+TABBY_API_KEY=...
+```
+
+`Restart=always` means the service also reloads itself after an edit without a
+password:
+
+```bash
+kill $(systemctl show tabby-proxy.service -p MainPID --value)
 ```
 ---
 
@@ -175,9 +190,9 @@ assistant turn and the session stops with no error at all.
 
 ### Solution
 The proxy injects the tool catalogue and the tool-call format into the system
-prompt, forces a non-streaming upstream call so complete responses can be
-intercepted, parses the tool call back out of the text, and re-emits the result
-as a valid OpenAI SSE stream carrying proper `tool_calls` deltas.
+prompt, parses the tool call back out of the text as it arrives, and re-emits the
+result as a valid OpenAI SSE stream carrying proper `tool_calls` deltas (see
+[Streaming and upstream retries](#streaming-and-upstream-retries)).
 
 The DSML the model emits is not stable between turns — this checkpoint uses at
 least four dialects, so the parser walks the tags instead of matching one regex:
@@ -213,7 +228,8 @@ journalctl -u tabby-proxy.service -f
 ```
 
 ### Self-test
-The parser ships with fixtures for each dialect above:
+The parser ships with fixtures for each dialect above, plus fixtures for the
+streaming hold-back window:
 
 ```bash
 ./venv/bin/python tabby_proxy.py --selftest
@@ -223,4 +239,54 @@ The parser ships with fixtures for each dialect above:
 The proxy forwards the client's own `Authorization` / `x-api-key` header, so no
 key is stored in this repository or in the service unit. A client that sends no
 key receives `401` unless `TABBY_API_KEY` is exported in the service
-environment.
+environment, e.g. through `~/.config/tabby-proxy.env`:
+
+```
+# ~/.config/tabby-proxy.env
+TABBY_API_URL=http://127.0.0.1:5000
+TABBY_API_KEY=...
+```
+
+---
+
+## Streaming and upstream retries
+
+### Retries while a model loads
+TabbyAPI answers `503` for a few seconds while it loads or reloads a model, and
+occasionally `502`/`529` under load. A single such answer used to end the turn.
+Every upstream call now retries up to 5 times with exponential backoff (2 s, 4 s,
+8 s, 16 s) on `429`/`500`/`502`/`503`/`504`/`529` and on connection failures, so
+a model reload no longer kills a request. A non-retryable status is returned to
+the client unchanged.
+
+### Tool calls without the stall
+Requests carrying `tools` used to be forced non-streaming so the whole
+completion could be parsed before answering, so the client sat silent for the
+entire generation. The tool path is now incremental: upstream deltas are relayed
+as they arrive, with the last 32 characters of `content` and of
+`reasoning_content` held back. `extract_tool_calls` discards everything from the
+first tool-syntax marker onwards and keeps everything before it, so holding back
+that window guarantees a marker is never emitted half-formed; a marker spanning
+two deltas is caught by the tail of the window. When no marker appears, the held
+tail is flushed at the end, and the final `finish_reason` and `tool_calls` deltas
+come from the same parser the non-streaming path uses.
+
+The hold-back exists because markers are recognised only once their keyword has
+arrived: `<tool_c` reads as prose, so without it a split `<tool_call>` could
+leak into the visible answer. `_HOLDBACK` must stay above
+`_MARKER_PREFIX_LIMIT`, which the self-test checks.
+
+### Reasoning streams too
+TabbyAPI streams `reasoning_content` separately from `content`, and that is
+where most of the visible latency lives, so the first reasoning delta now
+reaches the client within milliseconds of the model starting rather than after
+the whole generation.
+
+### Verifying a live stream
+```bash
+curl -N -s http://127.0.0.1:8081/v1/chat/completions \
+  -H "x-api-key: $TABBY_API_KEY" -H 'content-type: application/json' \
+  -d '{"model": "DeepSeek-V4-Flash-0731-exl3-2.32bpw",
+       "messages": [{"role": "user", "content": "Count from 1 to 5."}],
+       "stream": true}'
+```

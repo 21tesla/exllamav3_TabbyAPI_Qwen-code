@@ -5,11 +5,18 @@ After=network.target docker.service
 [Service]
 Type=simple
 User=logan
-WorkingDirectory=/home/logan/software/exllamav3-anemone
-ExecStart=/home/logan/software/exllamav3-anemone/venv/bin/python /home/logan/software/exllamav3-anemone/tabby_proxy.py
+# %h is the service user's home directory, so this checkout is expected at
+# $HOME/software/exllamav3-anemone. Point WorkingDirectory and ExecStart at
+# wherever the proxy actually lives.
+WorkingDirectory=%h/software/exllamav3-anemone
+ExecStart=%h/software/exllamav3-anemone/venv/bin/python %h/software/exllamav3-anemone/tabby_proxy.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+# Optional. The proxy forwards the client's own Authorization / x-api-key header,
+# so no key is needed here; set one only for clients that send none. The leading
+# "-" makes the file optional, so the unit starts fine without it.
+EnvironmentFile=-%h/.config/tabby-proxy.env
 
 [Install]
 WantedBy=multi-user.target

@@ -1,10 +1,12 @@
 import os
 import re
 import json
+import time
 import uuid
+import asyncio
 import logging
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
@@ -571,39 +573,231 @@ def process_message_tools_and_thinking(msg: dict, choice: dict):
             logger.warning(f"Tool-call syntax present but unparsed: {raw[:300]!r}")
 
 
-async def sse_event_stream(resp_json: dict, requested_model: Optional[str] = None):
-    """Converts a parsed tool-completion JSON object into OpenAI-compliant SSE chunks."""
-    resp_id = resp_json.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}")
-    model = requested_model or resp_json.get("model", "qwen")
-    created = resp_json.get("created", 1700000000)
+# ---------------------------------------------------------------------------
+# Upstream resilience and incremental streaming
+#
+# Two problems live here:
+#
+#   1. TabbyAPI answers 503 - and, while a model is loading, occasionally 502
+#      or 529 - for a few seconds at a time. One such answer used to end the
+#      turn outright, so every upstream call is now retried with backoff.
+#
+#   2. Requests carrying tools used to be forced non-streaming so the proxies
+#      could parse the whole completion before answering, leaving the client
+#      silent for the entire generation. The tool path now relays upstream
+#      deltas as they arrive, holding back a short tail of content and of
+#      reasoning_content. extract_tool_calls discards everything from the first
+#      tool-syntax marker onwards and keeps everything before it, so holding
+#      back the last _HOLDBACK characters is enough to guarantee a marker is
+#      never emitted half-formed. If no marker appears, the held tail is
+#      flushed at the end.
+# ---------------------------------------------------------------------------
 
-    for choice in resp_json.get("choices", []):
-        idx = choice.get("index", 0)
-        message = choice.get("message", {})
-        content = message.get("content")
-        reasoning_content = message.get("reasoning_content")
-        tool_calls = message.get("tool_calls")
-        finish_reason = choice.get("finish_reason", "stop")
+_TOOL_MARKER_RE = re.compile(
+    r"<\s*/?\s*(?:[|\uff5c]|\\uff5c|\\u2581)?\s*(?:dsml|tool_calls?\b|tool\b|param(?:eter)?s?\b|function|invoke)"
+    r"|\[tool_call\s*:"
+    r"|```(?:tool_call|json)?\s*\{"
+    r"|</?think>",
+    re.IGNORECASE,
+)
+# Longest run of characters that can stand between the "<" of a marker and the
+# keyword that completes it. The hold-back window has to cover this so a marker
+# split across two deltas is never half-emitted.
+_MARKER_PREFIX_LIMIT = 8
+_HOLDBACK = 32
+_MAX_ATTEMPTS = 5
+_RETRY_STATUS = {429, 500, 502, 503, 504, 529}
+_UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
+_CONNECT_ERROR = '{"error": "Could not connect to TabbyAPI downstream server."}'
 
-        # Initial role chunk
-        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': idx, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
 
-        # Reasoning chunk (if reasoning_content exists)
-        if reasoning_content:
-            yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': idx, 'delta': {'reasoning_content': reasoning_content}, 'finish_reason': None}]})}\n\n"
+def _find_tool_call_marker(text: str) -> int:
+    """Index of the earliest tool-syntax marker in text, or -1 when there is none.
 
-        # Content chunk (if any pre-tool thought exists)
-        if content:
-            yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': idx, 'delta': {'content': content}, 'finish_reason': None}]})}\n\n"
+    A marker is only recognised once its keyword has arrived, so a partial one
+    (e.g. "<tool_c") reads as prose here and stays inside the hold-back window.
+    """
+    match = _TOOL_MARKER_RE.search(text)
+    return match.start() if match else -1
 
-        # Tool calls chunks
-        if tool_calls:
-            for tc_idx, tc in enumerate(tool_calls):
-                yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': idx, 'delta': {'tool_calls': [{'index': tc_idx, 'id': tc['id'], 'type': 'function', 'function': {'name': tc['function']['name'], 'arguments': tc['function']['arguments']}}]}, 'finish_reason': None}]})}\n\n"
 
-        # Finish reason chunk
-        yield f"data: {json.dumps({'id': resp_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model, 'choices': [{'index': idx, 'delta': {}, 'finish_reason': finish_reason}]})}\n\n"
+def _backoff(attempt: int) -> float:
+    return float(min(2 ** attempt, 16))
 
+
+async def post_upstream_json(client: httpx.AsyncClient, url: str, body: dict, headers: dict) -> httpx.Response:
+    """POST a buffered completion, retrying connect failures and transient statuses."""
+    last_error: Optional[Exception] = None
+    for attempt in range(_MAX_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(_backoff(attempt))
+        try:
+            response = await client.post(url, json=body, headers=headers)
+        except httpx.TransportError as exc:
+            last_error = exc
+            logger.warning(f"Upstream connection failed ({attempt + 1}/{_MAX_ATTEMPTS}): {exc}")
+            continue
+        if response.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS - 1:
+            logger.warning(f"Upstream returned {response.status_code}, retrying ({attempt + 1}/{_MAX_ATTEMPTS})")
+            await response.aclose()
+            continue
+        return response
+    raise last_error if last_error else httpx.ConnectError("upstream is unreachable")
+
+
+async def open_upstream_stream(client: httpx.AsyncClient, url: str, body: dict, headers: dict):
+    """Open an upstream SSE stream, retrying connect failures and transient statuses.
+
+    Returns the still-entered stream context along with its response so the
+    caller can inspect the status before relaying or rejecting it.
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(_MAX_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(_backoff(attempt))
+        stream_ctx = client.stream("POST", url, json=body, headers=headers)
+        try:
+            response = await stream_ctx.__aenter__()
+        except httpx.TransportError as exc:
+            last_error = exc
+            logger.warning(f"Upstream stream failed to open ({attempt + 1}/{_MAX_ATTEMPTS}): {exc}")
+            continue
+        if response.status_code in _RETRY_STATUS and attempt < _MAX_ATTEMPTS - 1:
+            logger.warning(f"Upstream stream returned {response.status_code}, retrying ({attempt + 1}/{_MAX_ATTEMPTS})")
+            await stream_ctx.__aexit__(None, None, None)
+            continue
+        return stream_ctx, response
+    raise last_error if last_error else httpx.ConnectError("upstream is unreachable")
+
+
+def _sse_chunk(resp_id: str, created: int, model: str, index: int, delta: dict, finish_reason: Optional[str] = None) -> str:
+    payload = {
+        "id": resp_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": index, "delta": delta, "finish_reason": finish_reason}],
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _unstreamed_remainder(parsed: Optional[str], raw: str, sent: int, field: str) -> str:
+    """The part of a parsed field that incremental streaming has not delivered yet."""
+    spoken = raw[:sent]
+    parsed = parsed or ""
+    if not parsed.startswith(spoken):
+        logger.warning(f"Streamed {field} prefix diverged from the parsed value; dropping the unsent remainder")
+        return ""
+    return parsed[len(spoken):]
+
+
+async def relay_upstream_stream(stream_ctx, response, client: httpx.AsyncClient) -> AsyncIterator[bytes]:
+    """Forward upstream SSE bytes untouched (used when no tools are in play)."""
+    try:
+        async for piece in response.aiter_raw():
+            yield piece
+    finally:
+        await stream_ctx.__aexit__(None, None, None)
+        await client.aclose()
+
+
+async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient, requested_model: Optional[str]) -> AsyncIterator[str]:
+    """Relay a tool-bearing completion as SSE, intercepting native tool syntax."""
+    resp_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    created = int(time.time())
+    model = requested_model or ""
+    index = 0
+    content_text = ""
+    reasoning_text = ""
+    sent_content = 0
+    sent_reasoning = 0
+    held = False
+    role_sent = False
+    finish_reason = "stop"
+    eos_reason = None
+
+    try:
+        async for line in response.aiter_lines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except Exception:
+                continue
+
+            for event_choice in event.get("choices", []):
+                if event_choice.get("finish_reason"):
+                    finish_reason = event_choice["finish_reason"]
+                    eos_reason = event_choice.get("eos_reason", eos_reason)
+                delta = event_choice.get("delta") or {}
+                if delta.get("reasoning_content"):
+                    reasoning_text += delta["reasoning_content"]
+                if delta.get("content"):
+                    content_text += delta["content"]
+
+                if not role_sent:
+                    role_sent = True
+                    yield _sse_chunk(resp_id, created, model, index, {"role": "assistant"})
+
+                if not held and (
+                    _find_tool_call_marker(content_text) != -1
+                    or _find_tool_call_marker(reasoning_text) != -1
+                ):
+                    held = True
+
+                if held:
+                    continue
+
+                limit = max(0, len(reasoning_text) - _HOLDBACK)
+                if limit > sent_reasoning:
+                    yield _sse_chunk(resp_id, created, model, index, {"reasoning_content": reasoning_text[sent_reasoning:limit]})
+                    sent_reasoning = limit
+
+                limit = max(0, len(content_text) - _HOLDBACK)
+                if limit > sent_content:
+                    yield _sse_chunk(resp_id, created, model, index, {"content": content_text[sent_content:limit]})
+                    sent_content = limit
+    finally:
+        await stream_ctx.__aexit__(None, None, None)
+        await client.aclose()
+
+    if not role_sent:
+        yield _sse_chunk(resp_id, created, model, index, {"role": "assistant"})
+
+    message = {"role": "assistant", "content": content_text or None, "reasoning_content": reasoning_text or None}
+    choice = {"index": index, "finish_reason": finish_reason}
+    process_message_tools_and_thinking(message, choice)
+    final_content = message.get("content")
+    final_reasoning = message.get("reasoning_content")
+    tool_calls = message.get("tool_calls")
+
+    for field, parsed, raw, sent in (
+        ("reasoning_content", final_reasoning, reasoning_text, sent_reasoning),
+        ("content", final_content, content_text, sent_content),
+    ):
+        remainder = _unstreamed_remainder(parsed, raw, sent, field)
+        if remainder:
+            yield _sse_chunk(resp_id, created, model, index, {field: remainder})
+
+    for tool_index, tool_call in enumerate(tool_calls or []):
+        yield _sse_chunk(resp_id, created, model, index, {"tool_calls": [{
+            "index": tool_index,
+            "id": tool_call["id"],
+            "type": "function",
+            "function": {
+                "name": tool_call["function"]["name"],
+                "arguments": tool_call["function"]["arguments"],
+            },
+        }]})
+
+    if not tool_calls and not final_content and not final_reasoning:
+        logger.warning(f"Upstream produced an empty completion (finish_reason={choice.get('finish_reason')!r}, eos_reason={eos_reason!r})")
+
+    yield _sse_chunk(resp_id, created, model, index, {}, choice.get("finish_reason", finish_reason))
     yield "data: [DONE]\n\n"
 
 
@@ -670,66 +864,65 @@ async def chat_completions_proxy(request: Request):
         if TABBY_API_KEY:
             headers["x-api-key"] = TABBY_API_KEY
 
-    # If streaming with no tools, pass through stream directly
-    if not has_tools and is_streaming:
-        async def downstream_stream():
-            async with httpx.AsyncClient() as stream_client:
-                async with stream_client.stream(
-                    "POST",
-                    f"{TABBY_API_URL}/v1/chat/completions",
-                    json=patched_body,
-                    headers=headers,
-                    timeout=300.0
-                ) as down_resp:
-                    async for chunk in down_resp.aiter_raw():
-                        yield chunk
+    url = f"{TABBY_API_URL}/v1/chat/completions"
+    client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
 
-        return StreamingResponse(downstream_stream(), media_type="text/event-stream")
+    if is_streaming:
+        stream_body = dict(patched_body)
+        stream_body["stream"] = True
+        if has_tools:
+            # The proxy synthesises its own stream, so upstream usage accounting is moot.
+            stream_body.pop("stream_options", None)
 
-    # If tools are active, disable downstream streaming so we can intercept and parse tool calls before client sees them
-    if has_tools and is_streaming:
-        patched_body["stream"] = False
-
-    async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(
-                f"{TABBY_API_URL}/v1/chat/completions",
-                json=patched_body,
-                headers=headers,
-                timeout=300.0
-            )
-        except httpx.ConnectError:
-            return Response(
-                content='{"error": "Could not connect to TabbyAPI downstream server."}',
-                status_code=502,
-                media_type="application/json"
-            )
+            stream_ctx, response = await open_upstream_stream(client, url, stream_body, headers)
+        except httpx.TransportError:
+            await client.aclose()
+            return Response(content=_CONNECT_ERROR, status_code=502, media_type="application/json")
 
         if response.status_code != 200:
-            return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+            upstream_error = await response.aread()
+            await stream_ctx.__aexit__(None, None, None)
+            await client.aclose()
+            return Response(content=upstream_error, status_code=response.status_code, media_type="application/json")
+
+        if has_tools:
+            return StreamingResponse(
+                stream_tools_response(stream_ctx, response, client, requested_model),
+                media_type="text/event-stream"
+            )
+
+        return StreamingResponse(
+            relay_upstream_stream(stream_ctx, response, client),
+            media_type="text/event-stream"
+        )
+
+    try:
+        try:
+            response = await post_upstream_json(client, url, patched_body, headers)
+        except httpx.TransportError:
+            return Response(content=_CONNECT_ERROR, status_code=502, media_type="application/json")
+
+        if response.status_code != 200:
+            return Response(content=response.content, status_code=response.status_code, media_type="application/json")
 
         try:
             resp_data = response.json()
         except Exception:
-            return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+            return Response(content=response.content, status_code=response.status_code, media_type="application/json")
 
         # Parse message content / reasoning for tool calls
         for choice in resp_data.get("choices", []):
             msg = choice.get("message", {})
             process_message_tools_and_thinking(msg, choice)
 
-        # If the client sent stream=True, convert the parsed result to valid SSE chunks
-        if has_tools and is_streaming:
-            return StreamingResponse(
-                sse_event_stream(resp_data, requested_model=requested_model),
-                media_type="text/event-stream"
-            )
-
         return Response(
             content=json.dumps(resp_data),
             status_code=200,
             media_type="application/json"
         )
+    finally:
+        await client.aclose()
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
@@ -806,7 +999,67 @@ def _selftest() -> int:
         if not ok:
             failures += 1
             print(f"     expected: {expected} cleaned={expected_clean!r}")
-    print(f"{len(cases) - failures}/{len(cases)} DSML self-test cases passed")
+
+    # The hold-back window only protects the stream while it covers the longest
+    # marker prefix; once a marker is whole, latching on it takes over.
+    if _HOLDBACK < _MARKER_PREFIX_LIMIT:
+        print(f"FAIL hold-back window {_HOLDBACK} is shorter than the marker prefix limit ({_MARKER_PREFIX_LIMIT})")
+        failures += 1
+    else:
+        print(f"ok   hold-back window {_HOLDBACK} covers the marker prefix limit ({_MARKER_PREFIX_LIMIT})")
+
+    fw = _SELFTEST_FW
+    lt, gt, low = "<", ">", chr(0x2581)
+    marker_cases = [
+        ("no marker", "All done, nothing to call.", -1),
+        ("bare tag", lt + "tool_call" + gt, 0),
+        ("marker after prose", "ab" + lt + "tool_call" + gt, 2),
+        ("case-insensitive", "ab" + lt + "|DSML|read_file" + gt, 2),
+        ("escaped bars", "ab" + lt + "\\uff5cDSML\\uff5c tool" + gt, 2),
+        ("name attribute dialect", "ab" + lt + fw + "DSML" + fw + ' name="read_file"' + gt, 2),
+        ("wrapper closer", "ab" + lt + "/" + fw + "DSML" + fw + "tool" + gt, 2),
+        ("escaped wrapper closer", "ab" + lt + "/\\uff5cDSML\\uff5c tool" + gt, 2),
+        ("end of sentence closer", "ab" + lt + "/" + fw + "tool" + low + "calls" + low + "end" + fw + gt, 2),
+        ("xml function form", "ab" + lt + "function=glob" + gt, 2),
+        ("bracketed form", "ab[tool_call: read_file]", 2),
+        ("inline think tag", "ab" + lt + "think" + gt, 2),
+        ("closing think tag", "ab" + lt + "/think" + gt, 2),
+        ("fenced json call", "ab```json" + chr(10) + '{"name": "x"}', 2),
+        ("parameter tag", 'ab' + lt + 'parameter name="p"' + gt + "v", 2),
+        ("half keyword", "ab" + lt + "tool_c", -1),
+        ("half escaped bar", "ab" + lt + "\\uff5c", -1),
+        ("half raw bar", "ab" + lt + fw, -1),
+        ("bare fence", "ab```", -1),
+        ("fence then language", "ab```json", -1),
+        ("bracket without colon", "ab[tool_call", -1),
+        ("ordinary code block", "ab```python" + chr(10) + "print(1)", -1),
+        ("html tag in prose", "wrap it in a <div>", -1),
+    ]
+    for name, text, expected in marker_cases:
+        got = _find_tool_call_marker(text)
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} marker {name}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected}")
+
+    remainder_cases = [
+        ("nothing sent yet", "Hello world", "Hello world<tool_call>x", 0, "Hello world"),
+        ("partly sent", "Hello world", "Hello world<tool_call>x", 5, " world"),
+        ("marker-only tail", "Hello", "Hello<tool_call>", 0, "Hello"),
+        ("empty after drop", None, "<tool_call>", 0, ""),
+        ("divergent prefix is dropped", "World", "abc", 2, ""),
+    ]
+    for name, parsed, raw, sent, expected in remainder_cases:
+        got = _unstreamed_remainder(parsed, raw, sent, "content")
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} remainder {name}: {got!r}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
+    total = len(cases) + len(marker_cases) + len(remainder_cases) + 1
+    print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
 
 
