@@ -25,6 +25,7 @@
 #
 # Override any path or name by exporting it before running, e.g.
 #   MODELS_DIR=/mnt/models ./install.sh
+#   PROXY_HOST=0.0.0.0 ./install.sh proxy   # for a containerised client
 
 set -Eeuo pipefail
 
@@ -50,6 +51,16 @@ TABBY_IMAGE="${TABBY_IMAGE:-ghcr.io/theroyallab/tabbyapi:cu13}"
 TABBY_CONTAINER="${TABBY_CONTAINER:-tabbyapi}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-5000}"
 PROXY_PORT="${PROXY_PORT:-8081}"
+
+# Where the proxy listens. The default keeps it on loopback, which is all a
+# host-side client (Qwen Code, curl, a shell script) needs. A containerised
+# client (OpenWebUI) cannot use it: rootless docker reaches the host only at the
+# host's own routable address, so it needs 0.0.0.0 and the host IP. See the
+# "Reaching the proxy from a container" section of README.md -- the proxy checks
+# the API key, but the port becomes reachable from the whole LAN.
+PROXY_HOST="${PROXY_HOST:-127.0.0.1}"
+# Written by step_proxy and read by the unit's EnvironmentFile= line.
+PROXY_ENV_FILE="${PROXY_ENV_FILE:-$HOME/.config/tabby-proxy.env}"
 
 # A single-arch "120a" build breaks the DSA decode graph path, so the main
 # extension is built for plain 12.0. The optional FP4 prefill kernel targets
@@ -167,14 +178,25 @@ network:
   port: 5000
 
 model:
-  # Both are resolved inside the container, where the pack is mounted at
-  # /app/models. model_name is what triggers the load at startup -- model_dir
-  # alone starts the server with no model, and every request then fails.
+  # Resolved inside the container, where the pack is mounted at /app/models.
   model_dir: /app/models
-  model_name: $MODEL_NAME
+
+  # No model_name, deliberately: with it set, TabbyAPI loads the model at
+  # startup and it occupies ~90 of the 98 GB of VRAM around the clock, including
+  # between sessions. inline_model_loading instead loads it on the first chat
+  # request that names it -- the first caller waits 10-20 s, later ones do not.
+  #
+  # TabbyAPI has no idle-unload (grep the tree: no ttl/keep_alive/unload_after),
+  # so once loaded it stays resident until POST /v1/model/unload.
+  #
+  # Inline loading is strict: a request naming a model that does not exist is
+  # rejected rather than running on the loaded one. use_dummy_models absorbs the
+  # fixed names clients send without meaning a specific model (gpt-3.5-turbo).
+  inline_model_loading: true
+  use_dummy_models: true
 
 # The DeepSeek sampler recommendation, not TabbyAPI's safe_defaults. safe_defaults
-# would fill temperature 0.8 / min_p 0.05 into requests that omit samplers, and
+# would fill temperature 0.8 / min_p 0.05 into requests that omit samplers;
 # low-temperature or truncating samplers are what drive this model into
 # repetition loops during long reasoning. See ANEMONE.md section 4.
 sampling:
@@ -301,8 +323,10 @@ step_tabby() {
             main.py --host 0.0.0.0
     fi
 
-    echo "waiting for TabbyAPI to load $MODEL_NAME (85 GB; several minutes)"
-    wait_for "http://127.0.0.1:$UPSTREAM_PORT/v1/models" "upstream :$UPSTREAM_PORT" 300 \
+    # Only the server has to come up; no model is loaded at boot by design, so
+    # this is seconds rather than the minutes a load would take.
+    echo "waiting for TabbyAPI to serve (the model loads on first use)"
+    wait_for "http://127.0.0.1:$UPSTREAM_PORT/v1/models" "upstream :$UPSTREAM_PORT" 60 \
         || warn "TabbyAPI has not answered yet; see: docker logs -f $TABBY_CONTAINER"
 }
 
@@ -319,15 +343,18 @@ step_proxy() {
     local unit_src="$REPO_DIR/tabby-proxy@.service"
     [ -f "$unit_src" ] || die "tabby-proxy@.service not found in $REPO_DIR"
 
-    # The unit's ExecStart points at the proxy inside LLAMA_DIR, so the two
-    # copies must agree. An identical file is left untouched: this repo is not
-    # the place to rewrite a checkout the user owns.
+    # The unit runs this repo's proxy on the fork's interpreter:
+    #   ExecStart=%h/software/exllamav3-anemone/venv/bin/python .../tabby_proxy.py
+    #
+    # So the fork's own tabby_proxy.py is no longer executed by anything. An
+    # older revision of this script ran it, and a leftover copy is therefore
+    # expected; it is reported once, not as an error, because deleting a file in
+    # a checkout this script does not own is not its call.
     local proxy_src="$REPO_DIR/tabby_proxy.py"
     if [ -f "$LLAMA_DIR/tabby_proxy.py" ] && ! cmp -s "$proxy_src" "$LLAMA_DIR/tabby_proxy.py"; then
-        warn "$LLAMA_DIR/tabby_proxy.py differs from this repo's copy, and the unit"
-        warn "runs the one in $LLAMA_DIR. Bring it in step deliberately:"
-        warn "  diff -u '$LLAMA_DIR/tabby_proxy.py' '$proxy_src'"
-        warn "  install -m755 '$proxy_src' '$LLAMA_DIR/tabby_proxy.py'"
+        warn "$LLAMA_DIR/tabby_proxy.py exists but is no longer used -- the unit"
+        warn "runs $proxy_src instead. Nothing needs to be copied."
+        warn "Remove it if you like: rm '$LLAMA_DIR/tabby_proxy.py'"
     fi
 
     install -Dm644 "$unit_src" "$unit_dir/tabby-proxy@.service"
@@ -353,6 +380,40 @@ step_proxy() {
     # A user service stops at logout unless lingering is on, which is what makes
     # it start at boot without anyone logging in.
     loginctl enable-linger "$USER" 2>/dev/null || warn "could not enable lingering"
+
+    # The unit reads this file with EnvironmentFile=, so the bind address lives
+    # outside the unit and survives reinstalls. Loopback needs no file at all --
+    # the proxy's own default is 127.0.0.1 -- so it is only written when the
+    # caller asks for something else.
+    #
+    # An existing file that says something else is *not* rewritten: it may hold
+    # a TABBY_API_URL or API key the user put there deliberately, and a repair
+    # run is not the moment to silently move a port. Whether it already says
+    # what we want is decided by the values, not by the file's text -- systemd
+    # accepts blank lines and comments, so byte comparison would warn on a file
+    # that is already correct.
+    if [ "$PROXY_HOST" != "127.0.0.1" ]; then
+        local want="TABBY_PROXY_HOST=$PROXY_HOST"$'\n'"TABBY_PROXY_PORT=$PROXY_PORT"$'\n'
+        # Last assignment wins in systemd, so keep only the final one per name.
+        # Read the file only when it exists: sed exits 2 on a missing file, and
+        # with `set -o pipefail` that aborts this whole step.
+        local have=""
+        if [ -e "$PROXY_ENV_FILE" ]; then
+            have="$(sed -n 's/^[[:space:]]*TABBY_PROXY_HOST[[:space:]]*=[[:space:]]*//p' "$PROXY_ENV_FILE" | tail -1)"
+        fi
+        if [ ! -e "$PROXY_ENV_FILE" ]; then
+            install -Dm600 /dev/null "$PROXY_ENV_FILE"
+            printf '# Written by install.sh (step_proxy). Read by tabby-proxy@.service\n%s' "$want" > "$PROXY_ENV_FILE"
+            echo "wrote $PROXY_ENV_FILE (proxy binds $PROXY_HOST:$PROXY_PORT)"
+        elif [ "$have" != "$PROXY_HOST" ]; then
+            warn "$PROXY_ENV_FILE sets TABBY_PROXY_HOST=${have:-<unset>}, not $PROXY_HOST,"
+            warn "and the unit will use it as-is. Replace the file to change that:"
+            warn "  printf '%s' '$want' > '$PROXY_ENV_FILE'"
+        else
+            echo "$PROXY_ENV_FILE already binds $PROXY_HOST:$PROXY_PORT"
+        fi
+    fi
+
     systemctl --user daemon-reload
 
     local instance
@@ -377,6 +438,11 @@ step_verify() {
     local ok=0
     docker inspect -f 'tabbyapi: {{.State.Status}} (restart={{.HostConfig.RestartPolicy.Name}})' \
         "$TABBY_CONTAINER" 2>/dev/null || { warn "container $TABBY_CONTAINER not found"; ok=1; }
+
+    # Read from the live process, not from $PROXY_HOST: what matters is what the
+    # running unit actually bound, which is the env file's value.
+    printf 'proxy listening on: %s\n' \
+        "$(ss -Hltn 'sport = :'"$PROXY_PORT"'' 2>/dev/null | awk '{print $4}' | paste -sd, - || echo unknown)"
 
     wait_for "http://127.0.0.1:$UPSTREAM_PORT/v1/models" "upstream :$UPSTREAM_PORT" 20 || ok=1
     wait_for "http://127.0.0.1:$PROXY_PORT/v1/models"    "via proxy :$PROXY_PORT"  10 || ok=1
@@ -422,10 +488,14 @@ run_step() {
 }
 
 usage() {
-    sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     printf '\nEnvironment overrides:\n'
     printf '  LLAMA_DIR=%s\n  MODELS_DIR=%s\n  CONFIG_DIR=%s\n' "$LLAMA_DIR" "$MODELS_DIR" "$CONFIG_DIR"
     printf '  MODEL_NAME=%s\n  TABBY_IMAGE=%s\n  TABBY_API_KEY=<from settings.json>\n' "$MODEL_NAME" "$TABBY_IMAGE"
+    printf '  PROXY_HOST=%s  PROXY_PORT=%s' "$PROXY_HOST" "$PROXY_PORT"
+    [ "$PROXY_HOST" = "127.0.0.1" ] \
+        && printf '  (loopback; PROXY_HOST=0.0.0.0 for a containerised client)\n' \
+        || printf '  (reachable from the LAN; see README.md)\n'
     printf '  FORCE_REBUILD=1 to rebuild the CUDA extension\n'
 }
 

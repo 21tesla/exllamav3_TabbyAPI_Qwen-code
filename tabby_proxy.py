@@ -1066,4 +1066,14 @@ def _selftest() -> int:
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         raise SystemExit(_selftest())
-    uvicorn.run(app, host="127.0.0.1", port=8081)
+    # TABBY_PROXY_HOST exists because a containerised client (OpenWebUI) cannot
+    # reach the host's loopback: rootless docker routes it through slirp4netns,
+    # so the only address that answers is the host's own routable IP. Bind that
+    # one deliberately rather than widening the default. TABBY_PROXY_PORT is here
+    # for the same reason: to let a deployment move the port without a patch.
+    # Upstream stays TABBY_API_URL (default 127.0.0.1:5000), unaffected by either.
+    uvicorn.run(
+        app,
+        host=os.getenv("TABBY_PROXY_HOST", "127.0.0.1"),
+        port=int(os.getenv("TABBY_PROXY_PORT", "8081")),
+    )

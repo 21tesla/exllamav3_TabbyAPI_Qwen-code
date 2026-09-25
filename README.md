@@ -13,7 +13,53 @@ Qwen Code CLI communicates with TabbyAPI via a lightweight FastAPI proxy. This p
 │  Qwen Code   │ ──> │  tabby_proxy │ ──> │   TabbyAPI   │
 │  Interactive │     │ (Port 8081)  │     │ (Port 5000)  │
 └──────────────┘     └──────────────┘     └──────────────┘
+                            ^                     │
+                            │                     v
+                     ┌──────────────┐     ┌──────────────┐
+                     │  OpenWebUI   │     │    model     │
+                     │ (Port 3001)  │     │ (loads on    │
+                     └──────────────┘     │  first use)  │
+                                          └──────────────┘
 ```
+
+Both clients point at the proxy, not at TabbyAPI directly. Qwen Code reaches it on `127.0.0.1`;
+OpenWebUI runs in a container and reaches it on the host's routable address. The model is not
+resident until something asks for it.
+
+### Model loading on demand
+
+The server starts with no model in VRAM. `config.yml` carries no `model_name`, and
+`inline_model_loading: true` makes TabbyAPI load the model named in a request the first time one
+arrives:
+
+```yaml
+model:
+  model_dir: /app/models
+  inline_model_loading: true
+  use_dummy_models: true
+```
+
+* **The first request pays, the rest do not.** A cold load takes 10–20 s (48 modules, ~90 GB) and
+  the caller waits through it. Afterwards the model stays resident and requests run at full speed.
+* **Inline loading is strict.** A request naming a model that is not in `model_dir` gets a `404`
+  and a model that fails to load gets a `503`, rather than silently being answered by whatever is
+  loaded. `use_dummy_models: true` exempts the fixed names some clients always send
+  (`gpt-3.5-turbo`), which then run on the loaded model.
+* **The loading request needs an admin key.** TabbyAPI refuses to swap models for a non-admin key,
+  because otherwise any caller could move ~90 GB. Use the same key for `api_key` and `admin_key`
+  if the same client does both.
+* **Nothing unloads it again.** TabbyAPI has no idle timeout, so a loaded model occupies VRAM until
+  `POST /v1/model/unload`. Use `software/tools/unload-deepseek.bash` to give the GPU back.
+
+If you would rather have the model ready before the first user arrives, load it ahead of time:
+
+```bash
+software/tools/load-deepseek.bash      # ~11 s, returns when the model is resident
+software/tools/unload-deepseek.bash    # gives the VRAM back
+```
+
+Both scripts read the key from `TABBY_API_KEY`, falling back to `~/.qwen/settings.json`, so neither
+carries a copy of it.
 
 `install.sh` performs every step below in order, and is idempotent — re-running it is the intended
 way to repair a machine whose TabbyAPI container did not come back after a reboot:
@@ -112,13 +158,21 @@ Every part of that command is load-bearing, and these are easy to get wrong in w
 * **`--host 0.0.0.0`.** The default is `127.0.0.1`, which inside a container is the container's own
   loopback that `-p 5000:5000` cannot reach. Command-line arguments override `config.yml`, so this
   and `network.host` must agree.
-* **`model_name` must be set in `config.yml`.** TabbyAPI only loads a model at startup when
-  `model.model_name` is present. With `model_dir` alone it starts an empty server that answers
-  every request with "no model loaded".
-* `--restart unless-stopped` is what brings the container back after a reboot. Without it the
-  container does not return, and nothing announces that.
+* **`model_name` is deliberately left out of `config.yml`.** Setting it makes TabbyAPI load the
+  model at startup, where it then holds ~90 GB of VRAM around the clock, including between
+  sessions. Left out, the server starts with nothing resident and `inline_model_loading: true`
+  loads the model on the first request that names it — the first caller waits 10–20 s, everyone
+  after that does not. The cost is a cold-start delay instead of a permanently occupied GPU; run
+  `software/tools/load-deepseek.bash` ahead of time if you would rather pay it early. There is no
+  idle-unload in TabbyAPI (no `ttl`, `keep_alive` or `unload_after` anywhere in the tree), so once
+  loaded the model stays until `POST /v1/model/unload`.
+* **`--restart unless-stopped` is what brings the container back after a reboot.** Without it the
+  container does not return, and nothing announces that. Note that Docker restart policies only
+  revive containers that still exist: delete the container and the next boot will not recreate it.
 * The model directory is mounted read-only in effect (`~/models` → `/app/models`) and the server
-  listens on `5000`, bound to loopback so it is not exposed to the network.
+  listens on `5000`. That port is bound to **loopback only**, so TabbyAPI itself is not reachable
+  from the network. Clients that cannot use `127.0.0.1` go through the proxy instead — see
+  [Reaching the proxy from a container](#reaching-the-proxy-from-a-container).
 * No `--ulimit memlock=-1`, although upstream suggests it. Docker here is **rootless**, and an
   unprivileged daemon cannot raise `RLIMIT_MEMLOCK`; passing it fails the container at OCI-create
   time with `error setting rlimit type 8: operation not permitted`.
@@ -161,6 +215,44 @@ The `~/.qwen/settings.json` file must be configured to route requests through th
 }
 ```
 
+`127.0.0.1` is right here: Qwen Code runs on this host. The proxy's *default* bind is
+`127.0.0.1:8081`, and a proxy bound to `0.0.0.0` answers on loopback too — so this address keeps
+working either way. The model name must match the directory under `model_dir` exactly: inline
+loading is strict, and a misspelt name gets a `404` rather than an answer from whatever is loaded.
+
+---
+
+## Configure OpenWebUI
+
+OpenWebUI runs in a container, so it cannot use the same address Qwen Code does. Point it at the
+proxy on the host's routable IP:
+
+```
+http://<host-ip>:8081/v1
+```
+
+and give it the same API key. The proxy has to be listening on `0.0.0.0` for this to work — see
+[Reaching the proxy from a container](#reaching-the-proxy-from-a-container).
+
+The address is stored in OpenWebUI's database, not in a config file, and the container's
+`OPENAI_API_BASE_URL` is empty, so the database is what wins. Read it back with:
+
+```bash
+DB=~/.local/share/docker/volumes/open-webui/_data/webui.db
+sqlite3 "$DB" "select json_extract(data,'\$.openai') from config;"
+```
+
+If you edit it directly, **stop the container first** — otherwise the running app writes its
+in-memory copy back over your change. Back the database up before writing to it:
+
+```bash
+sqlite3 "$DB" ".backup '$DB.bak'"
+```
+
+The admin key is what makes `/v1/models` list the model even when nothing is loaded; a non-admin key
+only ever sees what is already resident. Since the WebUI is also the client that triggers the first
+load, it wants the admin key.
+
 ---
 
 ## TabbyAPI Schema Guard Middleware (`tabby_proxy.py`)
@@ -169,7 +261,8 @@ The `~/.qwen/settings.json` file must be configured to route requests through th
 When Qwen Code CLI registers built-in tools (such as `get_goal` or `list_agents`), it submits tool schemas that omit the `"parameters"` field since they take no arguments. However, TabbyAPI runs strict Pydantic model validation on incoming tool schemas and will reject any request missing the `"parameters"` field with a `422 Unprocessable Content` error.
 
 ###  Solution
-A pre-validation block was written the exllamav3 directory, in my case, it was`/home/logan/software/exllamav3-anemone/tabby_proxy.py`. The `patch_tools_schema`  intercepts and supplies a default empty schema parameter object.
+`tabby_proxy.py` in this repository. Its `patch_tools_schema` intercepts requests and supplies a
+default empty schema parameter object.
 
 ### Install the proxy service
 
@@ -188,9 +281,17 @@ systemctl --user status "tabby-proxy@$home.service"
 journalctl --user -u "tabby-proxy@$home.service" -f
 ```
 
-The unit's `ExecStart` runs the proxy from the ExLlamaV3 checkout
-(`%h/software/exllamav3-anemone/tabby_proxy.py`), so that copy is the one that serves; keep it in
-step with the copy in this repository.
+The unit names two directories, on purpose:
+
+* **the proxy** comes from this repository — `%h/software/exllamav3_TabbyAPI_Qwen-code/tabby_proxy.py`,
+  which is also the unit's `WorkingDirectory`
+* **the interpreter** comes from the ExLlamaV3 checkout —
+  `%h/software/exllamav3-anemone/venv/bin/python`, the only place `uvicorn` and `httpx` are installed
+
+Splitting them is what lets the proxy be edited here and take effect on `systemctl --user restart`,
+with nothing copied into a read-only upstream checkout. An earlier revision ran the fork's copy of
+the proxy instead, which meant every fix had to be copied across by hand and the two silently
+drifted.
 
 To reload after editing the proxy:
 
@@ -206,13 +307,50 @@ loginctl enable-linger "$USER"
 loginctl show-user "$USER" -p Linger
 ```
 
-The optional `EnvironmentFile` holds anything the unit cannot pick up from the client (see
-[Upstream API key](#upstream-api-key)):
+The optional `EnvironmentFile` holds anything the unit cannot pick up from the client, including
+where the proxy itself listens:
 
 ```
 # /home/logan/.config/tabby-proxy.env
 TABBY_API_URL=http://127.0.0.1:5000
+TABBY_PROXY_HOST=0.0.0.0
+TABBY_PROXY_PORT=8081
 TABBY_API_KEY=...
+```
+
+`TABBY_API_URL` points at TabbyAPI; `TABBY_PROXY_HOST` and `TABBY_PROXY_PORT` are where the proxy
+accepts connections and default to `127.0.0.1:8081` when unset. `install.sh` writes the file when
+`PROXY_HOST` is not the default:
+
+```bash
+PROXY_HOST=0.0.0.0 ./install.sh proxy
+```
+
+#### Reaching the proxy from a container
+
+Docker here is **rootless**, and rootless containers reach the host through `slirp4netns`, which
+gives them no route to the host's `127.0.0.1` — nor to the bridge gateway `172.17.0.1`. The only
+address that answers is the host's own routable IP:
+
+```bash
+ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1   # e.g. 130.63.104.106
+```
+
+So a containerised client (OpenWebUI) needs the proxy on `0.0.0.0` and addressed by that IP:
+
+```
+http://130.63.104.106:8081/v1
+```
+
+That does expose the port to the LAN, which is the trade-off. The proxy authenticates with the
+same key as TabbyAPI, so what is reachable is a key-checked API, not an open one. TabbyAPI itself
+stays on loopback. If the proxy should stay host-only, leave `TABBY_PROXY_HOST` unset and give the
+container a host-network or a tunnel instead.
+
+Check where a running proxy actually listens, rather than what the file says:
+
+```bash
+ss -Hltnp 'sport = :8081'
 ```
 
 #### Why not a system unit
@@ -239,6 +377,36 @@ To verify everything is working end-to-end, run a quick headless command from th
 ```bash
 qwen --prompt "Solve 5 + 5"
 ```
+
+`./install.sh verify` checks the same chain without a client: container state, upstream on `:5000`,
+proxy on `:8081`, the proxy's bind address, which units are active, and one authenticated completion
+through the proxy. A `401` there means the key in `api_tokens.yml` and the one in
+`~/.qwen/settings.json` have diverged.
+
+Two things are worth checking by hand after a change to the layout:
+
+```bash
+# Nothing is in VRAM at startup; the model appears only after a request names it
+nvidia-smi --query-gpu=memory.used --format=csv,noheader
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $KEY" \
+    http://127.0.0.1:8081/v1/models      # 200 with the admin key, 401 without one
+
+# A containerised client can reach the proxy (401 = reachable, needs a key)
+docker exec open-webui curl -s -o /dev/null -w '%{http_code}\n' \
+    http://130.63.104.106:8081/v1/models
+```
+
+If OpenWebUI reports that it cannot connect, check its stored base URL rather than the UI — the
+value lives in its database and an empty `OPENAI_API_BASE_URL` in the container environment means
+the database wins:
+
+```bash
+DB=~/.local/share/docker/volumes/open-webui/_data/webui.db
+sqlite3 "$DB" "select json_extract(data,'\$.openai.api_base_urls') from config;"
+```
+
+Change it with the container **stopped**, or the running app will write its in-memory copy back
+over your edit on the next settings save.
 
 
 ---

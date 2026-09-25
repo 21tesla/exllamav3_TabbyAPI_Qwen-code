@@ -10,23 +10,34 @@
 # on:  loginctl enable-linger "$USER"
 #
 # Stop the system unit first (sudo systemctl disable --now tabby-proxy.service),
-# otherwise both bind 127.0.0.1:8081 and one of them crash-loops.
+# otherwise both bind the same port and one of them crash-loops.
 Description=TabbyAPI Schema Guard Middleware Proxy (user instance for %I)
 After=network.target
 
 [Service]
 Type=simple
-# %h resolves to *your* home here, because a user manager runs as you. In a
-# system unit the same %h would resolve to the system manager's home (/root)
-# and the service would die with status=203/EXEC.
-WorkingDirectory=%h/software/exllamav3-anemone
-ExecStart=%h/software/exllamav3-anemone/venv/bin/python %h/software/exllamav3-anemone/tabby_proxy.py
+# Two directories are named separately on purpose:
+#
+#   code  -- this repo, %h/software/exllamav3_TabbyAPI_Qwen-code (WorkingDirectory,
+#            which also fixes the proxy's own relative paths)
+#   venv  -- the ExLlamaV3 fork, %h/software/exllamav3-anemone/venv, which is the
+#            only place uvicorn and httpx are installed
+#
+# Running the proxy out of the fork would work too, and older revisions of this
+# file did exactly that. It is a bad default: the fork is a read-only upstream
+# checkout, so the proxy had to be copied into it by hand and the two copies
+# drifted silently. This repo is where the proxy is edited, so this is what it
+# runs.
+WorkingDirectory=%h/software/exllamav3_TabbyAPI_Qwen-code
+ExecStart=%h/software/exllamav3-anemone/venv/bin/python %h/software/exllamav3_TabbyAPI_Qwen-code/tabby_proxy.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 # Optional. Only needed for clients that send no Authorization / x-api-key
 # header, since the proxy otherwise forwards the client's own. This is also the
-# place to set TABBY_API_URL when TabbyAPI is not on 127.0.0.1:5000.
+# place to set TABBY_API_URL when TabbyAPI is not on 127.0.0.1:5000, and
+# TABBY_PROXY_HOST / TABBY_PROXY_PORT to move where the proxy itself listens
+# (both default to 127.0.0.1:8081).
 EnvironmentFile=-%h/.config/tabby-proxy.env
 
 [Install]
