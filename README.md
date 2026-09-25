@@ -142,6 +142,8 @@ paths outside `/root` before it restarts the service:
 ./install-tabby-proxy-service.sh
 ```
 
+For a machine-agnostic unit, see `tabby-proxy@.service` below.
+
 The unit is:
 
 ```
@@ -178,6 +180,36 @@ password:
 ```bash
 kill $(systemctl show tabby-proxy.service -p MainPID --value)
 ```
+
+### User-agnostic alternative: `tabby-proxy@.service`
+
+The template is the same service without absolute paths, instantiated per home
+directory. It runs under `systemd --user`, where `%h` *does* mean your home, and
+it needs no sudo. **Run one or the other** — both bind `127.0.0.1:8081`.
+
+```bash
+home=$(systemd-escape --path "$HOME")
+systemctl --user daemon-reload
+systemctl --user enable --now "tabby-proxy@$home.service"      # instance: tabby-proxy@home-logan.service
+systemctl --user status "tabby-proxy@$home.service"
+journalctl --user -u "tabby-proxy@$home.service" -f
+```
+
+If you switch from the system unit, disable it first or one of the two will
+crash-loop on the occupied port:
+
+```bash
+sudo systemctl disable --now tabby-proxy.service
+```
+
+A user service is stopped at logout unless lingering is on, which lets it start
+at boot without you logging in:
+
+```bash
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" -p Linger
+```
+
 ---
 
 ## 4. Verification

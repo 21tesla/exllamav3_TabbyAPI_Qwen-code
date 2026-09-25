@@ -1,0 +1,33 @@
+[Unit]
+# systemd --user template: one instance per checkout, chosen by the
+# path-encoded home directory.
+#
+#   home=$(systemd-escape --path "$HOME")
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now "tabby-proxy@$home.service"
+#
+# No sudo is involved. The instance survives logout or reboot if lingering is
+# on:  loginctl enable-linger "$USER"
+#
+# Stop the system unit first (sudo systemctl disable --now tabby-proxy.service),
+# otherwise both bind 127.0.0.1:8081 and one of them crash-loops.
+Description=TabbyAPI Schema Guard Middleware Proxy (user instance for %I)
+After=network.target
+
+[Service]
+Type=simple
+# %h resolves to *your* home here, because a user manager runs as you. In a
+# system unit the same %h would resolve to the system manager's home (/root)
+# and the service would die with status=203/EXEC.
+WorkingDirectory=%h/software/exllamav3-anemone
+ExecStart=%h/software/exllamav3-anemone/venv/bin/python %h/software/exllamav3-anemone/tabby_proxy.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Optional. Only needed for clients that send no Authorization / x-api-key
+# header, since the proxy otherwise forwards the client's own. This is also the
+# place to set TABBY_API_URL when TabbyAPI is not on 127.0.0.1:5000.
+EnvironmentFile=-%h/.config/tabby-proxy.env
+
+[Install]
+WantedBy=default.target
