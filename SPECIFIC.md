@@ -107,7 +107,10 @@ that the stub is a stable decoding attractor rather than a random slip.
 ## 4. Three families
 
 The names are not random. They fall into three groups, which is the detail §2.8's phrase
-"one-off names" does not capture:
+"one-off names" does not capture. **Read this section together with §14.1**: the second probe
+proved that two of these families (`ead`-style truncation and the wire-format vocabulary) are
+produced by our *own* tag scanner misreading a mangled closer, and that the grouping below is
+about what the model emitted, not about what the client was told.
 
 **Wire-format vocabulary** — `tool_result`, `arguments`, `name`, `call` ×2. These are the field
 names and content-block types of the OpenAI/Anthropic tool-calling formats. `tool_result` is the
@@ -136,8 +139,11 @@ had two inventions. Never mid-batch, never last, across widths 2, 2, 8, 9, 9, 13
 nine.
 
 That is the opposite of what a sampler tail artefact would produce, and it is also what rules out
-the most plausible proxy bug. `runtool_call` *looks* like delta-boundary concatenation, so it was
-checked directly:
+the most plausible proxy bug. **§14.1 retires this rule as evidence**, at least for the
+DSML-sourced names: `extract_tool_calls` inserts the DSML pass's results ahead of the JSON pass's
+unconditionally, so a stray tag appearing 8th in the stream is still reported at index 0. The
+reasoning below therefore stands only for calls that came from the JSON scan. `runtool_call`
+*looks* like delta-boundary concatenation, so it was checked directly:
 
 * `_TOOL_MARKER_RE`'s latch sets `held = True`, which **discards** held text. A marker split across
   deltas loses a fragment; it cannot be prepended to a name.
@@ -386,3 +392,158 @@ directly. A request to run `ls` with only `read_file` declared produced
 `stop` — no invented name. Nine for nine inventions came from the model's *own* choice of tool
 during real work; it does not manufacture one on demand. Reproducing the failure therefore needs a
 genuine task, not a prompt that names a fake tool.
+
+## 14. The second probe — same session, longer context, different failure (2026-09-26 19:00→19:30)
+
+The ndlite numbers above are the **first** probe. A second ran later the same day in
+`e8ee13a8` (the very session §2.11's original abort came from), on the same model, with
+`TABBY_PROXY_RAW_LOG` armed. It changed the thesis, so it is recorded separately: the ndlite
+figures must not absorb these.
+
+Totals for the day, all sessions, from the proxy journal: **316 calls, 13 undeclared-name
+warnings, 2 dropped-required-parameter warnings, 3 unparsed completions, 0 repetition, 0
+malformed, 0 non-2xx on inference.** Twelve of the thirteen undeclared names are in this one
+session, against nine in the whole ndlite audit.
+
+### 14.1 The instrument earned its keep immediately
+
+Arming the raw dump was the difference between a guess and a diagnosis. The two new warnings
+looked, from the decoded line alone, like invented tool names:
+
+```
+19:16:11 [WARNING] Tool call '_call'        is not one of the 20 tools this request declared (batch=4)
+19:19:36 [WARNING] Tool call '_placeholder' is not one of the 20 tools this request declared (batch=4)
+```
+
+`batch=4` is the item 2 instrumentation working in production. The dumps, replayed through the
+proxy's **own** `extract_tool_calls` offline, showed neither name is invented by the model:
+
+| payload | the model wrote | our scanner read |
+|---|---|---|
+| `19:16:11` | `<tool_call>{grep_search}</…>` then a stray closer `</｜DSML｜_call>` | a call named `_call`, `{}` |
+| `19:19:36` | `<` `\` `｜DSML｜_placeholder>` — meant `</`, wrote a backslash | a call named `_placeholder`, `{}` |
+
+Neither payload contains a `"name": "_call"`. Both artefacts are **our parser**, and the
+mechanism is specific: `_TAG_RE = <[^<>]{0,200}>` matches `</｜DSML｜_call>` because the bar is
+the fullwidth U+FF5C, not ASCII. `split_dsml_tag` folds each bar to a space and takes the first
+word after DSML — `_call` — and `classify_dsml_tag` treats *any* DSML tag carrying a keyword as
+the name-as-tag-name dialect, so a **closer** became a call.
+
+This reinterprets §4 and §5 rather than extending them:
+
+* `runtool_call` is not unique. The family is **characters lost at long context**, and `_call`,
+  `_placeholder` and probably `all`, `ead`, `editing`, `on` (substrings of tag names) are in it.
+  Only `_call` and `_placeholder` are *proven*, because only they were inside an armed dump.
+* **§5's position-0 rule is an artefact of our own step ordering.** `extract_tool_calls` runs the
+  DSML pass (step 1) before the JSON pass (step 2), so every DSML-sourced call is inserted ahead
+  of every JSON-sourced one. In the `_call` payload the stray tag is the **8th** tag in the
+  stream, and it still lands at index 0. Position 0 was offered as evidence against a sampler
+  tail; for DSML-sourced calls it carries no such signal. The `runtool_call` position argument
+  stands only if that artefact was JSON-sourced.
+* §2's method gains its strongest tool: `ast.literal_eval` on the log's `repr()`, then replay
+  through the real extractor. A guess about parser behaviour is worth nothing next to it.
+
+### 14.2 The width story does not survive
+
+The same window produced the widest batch of either probe:
+
+```
+19:29:10  parsed 48 tool call(s) from content: 25 grep_search + 15 glob + 8 read_file
+```
+
+**Width 48, and it was entirely clean** — no stub, no undeclared name, no dropped parameter.
+§6 leant on "width ≥ 2 is where risk lives". The width-1 safety claim is untouched (still no
+invention in a width-1 turn anywhere), but width is now a poor predictor in the other direction:
+one clean 48, clean 2s, dirty 2s. What the dirty turns share is not width but **malformed
+emission** — and once the parser artefacts are excluded (§14.1), the remaining failures are all
+of one kind.
+
+### 14.3 The real fault: ASCII glyph loss past ~180k tokens, and the session it cost
+
+The session ended at **195 432 input tokens** (`context` at 186 000 per the user). Its last
+completion took 37.8 s and came back with the model's own glyphs corrupted:
+
+```
+23:29:51  in=195432 out=2046 status=200 dur=37843ms
+```
+
+The payload holds **1 opening `<tool_call>` and zero `</tool_call>`**; every closer is a
+mangled `</｜tool>`-shaped fragment. The mangling is **exact and locatable**: 98 ASCII quotes,
+then at raw offset 3949 — precisely the first mangled closer — everything following uses
+typographic `“ ”` (138) and fullwidth `｜` (36). A `{"name": "write_file"}` with a curly quote is
+not JSON; `raw_decode` failed, `repair_truncated_json` returned None, both the DSML and JSON
+passes found nothing, and `extract_tool_calls` returned `None`.
+
+What followed, measured on the captured payload:
+
+| reading | recovered |
+|---|---|
+| as shipped | **0 of 7 calls** |
+| quotes folded to ASCII first | 6 of 7 (all after the first) |
+| truncate at the first mangled closer | the first (`write_file`) |
+
+So two independent defects, and the second is not about glyphs at all. The **first** call's
+object ends `…main())\n"}` with **zero curly quotes in it** — it was already ASCII. It ends
+`</｜DSML｜…>` instead of `}`, so its own closer is missing. `repair_truncated_json` exists for
+exactly that and handles it when handed the bounded fragment; the caller handed it *the rest of
+the completion*, so its `cuts` search found the last structural character of the whole payload,
+placed all the later markup inside the fragment, and failed. The one call that was ASCII was
+lost by a bounding bug in the caller, not by the glyph loss.
+
+Downstream, the turn did not reach the client as an error. `process_message_tools_and_thinking`
+downgraded `finish_reason` to `stop` and handed over 5 525 characters of prose with
+`<tool_call>` and `{“name”: …` in it. The safety net §2.8 added did its job — no
+`InvalidStreamError`, no abort — but the model's answer was a *description* of a `write_file`
+it never got to perform, as plain text. That is the observable end of the session: last
+inference request 19:29:52, no request after it, and nothing but a local `/stats` in the
+transcript.
+
+The same glyph loss also produced the three mangled-closer warnings above, and two `unparsed`
+rows earlier in the day from other shapes (a truncated opener at 15:10, and **nine consecutive
+`<tool_call>` openers with no closers** at 15:12 — a repetition-like loop that
+`_strip_repetition_tail` did not catch, because it only strips a run at the very *tail*).
+
+### 14.4 Fixes shipped, and what they are worth
+
+Three changes, each one replayed against the captured payloads and locked into `--selftest`
+(63 → **68** cases):
+
+1. **`fold_typographic`** — a second reading of the completion with `“ ” ‘ ’` mapped to ASCII
+   quotes. Applied *per bracket and only after the model's own glyphs fail*, never in place: an
+   apostrophe in prose is legitimate text, and a real call must win. Folding is hoisted out of
+   the scan, since the completion can be hundreds of KB.
+2. **`_fragment_ends` + resuming after a repair** — bounds the fragment offered to
+   `repair_truncated_json` at closing-tag positions only. Interior braces are deliberately *not*
+   offered: a cut there yields a fragment that parses while having silently dropped part of the
+   value, which is the one outcome the repair is written to avoid. The scan also resumes after
+   the repaired value instead of jumping to the end of the text, so a malformed first call no
+   longer hides its siblings — worth 6 of the 7 calls here.
+3. **`fold_dsml_syntax` + `classify_dsml_tag` guard** — normalises the mangled tag forms, and
+   refuses to read a DSML tag as a call when it is a *closer* or when its keyword begins with
+   `_`. No tool name starts with an underscore; `_call` and `_placeholder` are the tails of
+   `tool_call` and `function_call`. A `name=` attribute still settles the dialect cases.
+
+Both captured payloads now extract correctly: `_call` → the 3 real calls and no stub;
+`unparsed` → all 7. The 48-call clean batch, the v1–v4 fixtures and the repetition suite are
+unchanged, and a 74 KB blob of brace-heavy curly-quoted prose parses in 3 ms.
+
+What the fixes do **not** address is the cause. The proxy cannot stop a checkpoint losing ASCII
+past ~180k tokens. It can only stop *misreading* the result — and it now recovers 7 of 7 calls
+from the exact payload that previously yielded nothing, which converts a lost turn into a slow
+one.
+
+### 14.5 What would settle this
+
+1. **A depth sweep on emission integrity.** The 180k figure is one observation. The `parsed N`
+   and warning counts already give the rate; a session at ~50 k, ~120 k and ~200 k on identical
+   work would show whether the glyph loss is a threshold or a slope.
+2. **A `finish_reason`-only fallback.** When a completion yields no call *and* its text contains
+   `<tool_call>`, the turn is already saved by downgrading to `stop`. A stronger option is to
+   re-ask once with the payload quoted back; not attempted, because it changes the client
+   contract.
+3. **Whether the earlier families were also parser-side.** `all`, `ead`, `editing`, `on` and
+   `oduct` predate the arming or fell outside a dump window. One hour with the flag on an
+   equivalent session, then the same replay, would move them out of inference into evidence.
+4. **The repetition stripper's `unparsed` gap** — nine openers with no closers mid-completion is
+   not a tail run. Cheap to check whether a mid-text run should be collapsed too.
+

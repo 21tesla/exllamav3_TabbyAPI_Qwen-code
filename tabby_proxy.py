@@ -71,6 +71,71 @@ _CALL_NAME_KEYS = {"name", "tool", "tool_name", "function"}
 _CALL_META_KEYS = {"name", "function", "tool", "tool_name", "action", "type", "id"}
 
 
+# A completion past roughly 180k tokens starts losing ASCII: `"` becomes `“`/`”`
+# and `|` becomes the fullwidth `｜` (U+FF5C). Neither is a quoting or bar character
+# to Python, so a tool-call object written in the wrong glyphs is not JSON at all
+# and every call in the turn is dropped. Observed 2026-09-26 on DeepSeek-V4-Flash
+# at 195k input tokens: the first call used ASCII, and everything after the first
+# mangled tag used these.
+_TYPOGRAPHIC_QUOTES = ("\u201c", "\u201d", "\u2018", "\u2019")
+_TYPOGRAPHIC_FOLDS = str.maketrans(
+    {c: '"' if c in ("\u201c", "\u201d") else "'" for c in _TYPOGRAPHIC_QUOTES}
+)
+
+
+def fold_typographic(text: str) -> str:
+    """Fold the quote-like glyphs a long-context completion substitutes for ASCII.
+
+    Applied as an alternative parse of the same completion, never in place: a
+    literal `“` inside a string value is legitimate text, so the original form is
+    always tried first and this is only a second reading. The fullwidth bar is
+    deliberately *not* folded here -- it is meaningful DSML syntax (see
+    `fold_dsml_syntax`).
+    """
+    return text.translate(_TYPOGRAPHIC_FOLDS)
+
+
+def fold_dsml_syntax(text: str) -> str:
+    """Rewrite a DSML tag the model mangled into the shape the scanner expects.
+
+    Two mangles are repaired, both from the long-context glyph loss above, and both
+    observed live on 2026-09-26:
+
+      * the fullwidth bar substituted for the ASCII pipe, so the closer
+        `<` `/` U+FF5C `DSML` U+FF5C `_call` `>` is not recognised as a DSML tag at
+        all and the word `_call` reads as a tool name;
+      * a backslash where the slash belongs, which turns the closer of a wrapper the
+        model never opened into something that looks like an opening tag.
+
+    A tag with no bar, escape or backslash is returned untouched: rewriting it would
+    turn ordinary prose markup (`<code>`) into a DSML call, which is the opposite of
+    the intent. A well-formed `</|DSML|tool>` is also left alone -- `split_dsml_tag`
+    already classifies it.
+    """
+    stripped = text.strip()
+    if not (stripped.startswith("<") and stripped.endswith(">")):
+        return text
+    inner = stripped[1:-1]
+    if not ("|" in inner or "\uff5c" in inner or "\\" in inner or "DSML" in stripped.upper()):
+        return text
+    leading_backslash = inner.startswith("\\")
+    if leading_backslash:
+        inner = inner[1:].lstrip()
+    inner = inner.replace("\\uff5c", "|").replace("\\u2581", "_").replace("\uff5c", "|")
+    closing = inner.startswith("/")
+    if closing:
+        inner = inner[1:].lstrip()
+    inner = inner.replace("|", "")
+    inner = re.sub(r"(?i)\bDSML\b", "", inner).strip()
+    if inner in _CALL_TAGS:
+        return text
+    if not re.fullmatch(r"[A-Za-z_][\w.\-]*", inner):
+        return text
+    # A backslash stood where the slash belongs, so the tag was written as a closer.
+    slash = "/" if (closing or leading_backslash) else ""
+    return f"<{slash}|DSML|{inner}>"
+
+
 def unescape_dsml(text: str) -> str:
     """Resolve literal \\uff5c / \\u2581 escapes into the characters they denote."""
     if "\\u" not in text:
@@ -101,8 +166,15 @@ def classify_dsml_tag(keyword: str, is_closing: bool, attrs: Dict[str, str], was
         return "call"
     if keyword in _PARAM_TAGS:
         return "param"
-    if was_dsml and (attrs.get("name") or keyword):
-        return "call"
+    if was_dsml and not is_closing and (attrs.get("name") or keyword):
+        # A DSML tag carrying a keyword is normally the `name`-as-tag-name dialect
+        # (`<|DSML|read_file>`), so it reads as a call. A keyword beginning with `_`
+        # is not that: it is the tail of `tool_call`/`function_call` left behind when
+        # the checkpoint truncated a closer, observed 2026-09-26 as calls named
+        # `_call` and `_placeholder`. No tool name starts with `_`, and a `name=`
+        # attribute settles it, so only the bare fragment is refused.
+        if attrs.get("name") or not keyword.startswith("_"):
+            return "call"
     return "other"
 
 
@@ -153,7 +225,7 @@ def parse_dsml_tool_calls(content: str) -> Tuple[List[dict], Optional[int]]:
             stack[-1]["buf"].append(content[cursor:match.start()])
         cursor = match.end()
 
-        keyword, is_closing, attrs, was_dsml = split_dsml_tag(match.group(0))
+        keyword, is_closing, attrs, was_dsml = split_dsml_tag(fold_dsml_syntax(match.group(0)))
         kind = classify_dsml_tag(keyword, is_closing, attrs, was_dsml)
         if kind == "call":
             name = attrs.get("name") or (keyword if keyword not in _CALL_TAGS else None)
@@ -468,6 +540,29 @@ def _open_structure(structural: str) -> List[str]:
 _CLOSER_FOR = {"{": "}", "[": "]"}
 
 
+def _fragment_ends(text: str, start: int):
+    """Candidate ends of the JSON value beginning at `start`, nearest first.
+
+    A value whose own closer is missing is followed by wrapper markup and, often,
+    sibling calls. Handing `repair_truncated_json` the rest of the completion makes
+    it pick the *last* structural character in the remainder, which lies beyond that
+    markup, and the repair then fails on bytes that were never part of the value --
+    observed 2026-09-26 on the first of seven calls, whose `write_file` object never
+    closed because the checkpoint replaced its `}` with `</|DSML|...>`.
+
+    Only closing-tag positions are offered, never interior braces: a cut at a brace
+    yields a fragment that still parses while having *silently dropped* part of the
+    value, which is the one outcome the repair is written to avoid. A cut inside a
+    string leaves that string unterminated, so the candidate fails and the search
+    moves outward. The end of the text is offered last, keeping the single-value
+    case exactly as it was.
+    """
+    limit = len(text)
+    for match in re.finditer(r"</", text[start:]):
+        yield start + match.start()
+    yield limit
+
+
 def repair_truncated_json(text: str) -> Optional[Any]:
     """Parse `text` as JSON, tolerating a JSON value cut short by a dropped closer.
 
@@ -716,20 +811,53 @@ def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str
     decoder = json.JSONDecoder(strict=False)
     start_pos = first_start if first_start < len(content) else 0
 
+    # The typographic fold is a per-bracket alternative, not a rewrite of the whole
+    # completion: a string value may legitimately contain `“`, so the model's own
+    # glyph must get the first attempt and the folded reading is only a fallback.
+    # Folded once here rather than inside the scan: the completion can be hundreds of
+    # kilobytes and the scan visits every bracket in it.
+    _foldable = any(g in content for g in _TYPOGRAPHIC_QUOTES)
+    readings = (content, fold_typographic(content)) if _foldable else (content,)
+    decoder_folded = json.JSONDecoder(strict=False)
+
     idx = start_pos
     while idx < len(content):
         ch = content[idx]
         if ch in ("{", "["):
-            try:
-                obj, end_pos = decoder.raw_decode(content, idx)
-            except Exception:
-                # A closer may simply be absent from the tail of the value; try
-                # a bounded repair before giving up on this starting bracket.
-                repaired = repair_truncated_json(content[idx:])
+            obj: Any = None
+            end_pos = idx
+            for decoder, text in ((decoder, readings[0]), (decoder_folded, readings[-1])):
+                try:
+                    obj, end_pos = decoder.raw_decode(text, idx)
+                    break
+                except Exception:
+                    obj = None
+            if obj is None:
+                # Either reading may have failed on a value whose closer is absent
+                # from the tail. Ask `repair_truncated_json` to bound the fragment
+                # itself: handed the rest of the completion it finds a *later*
+                # structural character first and then fails, losing a call that
+                # parses once its own object is isolated -- observed 2026-09-26 on
+                # the first of seven calls, whose `write_file` object simply never
+                # closed.
+                repaired = None
+                used_limit = len(content)
+                for text in readings:
+                    for limit in _fragment_ends(text, idx):
+                        repaired = repair_truncated_json(text[idx:limit])
+                        if repaired is not None:
+                            used_limit = limit
+                            break
+                    if repaired is not None:
+                        break
                 if repaired is None:
                     idx += 1
                     continue
-                obj, end_pos = repaired, len(content)
+                # Resume after the repaired value, not at the end of the text: the
+                # calls that follow a malformed one are still parseable, and the
+                # 2026-09-26 completion that motivated this carried six of them
+                # after the truncated first.
+                obj, end_pos = repaired, used_limit
             if isinstance(obj, list):
                 for item in obj:
                     if isinstance(item, dict):
@@ -1616,6 +1744,40 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
+    # A completion past roughly 180k tokens loses ASCII: `"` becomes `“`/`”` and `|`
+    # becomes the fullwidth `｜`. Neither reads as a quote or a bar to Python, so a
+    # call written in those glyphs is not JSON at all and every call in the turn was
+    # lost. Captured verbatim from session e8ee13a8 on 2026-09-26 (195k input
+    # tokens), together with the mangled closing tags the same glyph loss produced.
+    typographic = (
+        "Reading the view.\n"
+        "<tool_call>\n"
+        "{“name”: “glob”, “arguments”: {“pattern”:“src/analysis_qt6/*.py”}}\n"
+        f"</{fw}>"
+    )
+    truncated_then_valid = (
+        "<tool_call>\n"
+        '{"name": "write_file", "arguments": {"content": "x"\n'
+        f"</{fw}DSML{fw}>\n<{fw}DSML{fw}>\n"
+        '{"name": "glob", "arguments": {"pattern": "y"}}\n'
+        f"</{fw}DSML{fw}>\n"
+    )
+    glyph_cases = [
+        ("typographic quotes still parse", typographic, ["glob"]),
+        ("stray closer is not a call", f"Prose.\n</{fw}DSML{fw}_call>", None),
+        ("stray opener-fragment is not a call", f"Prose.\n<\\{fw}DSML{fw}_placeholder>", None),
+        ("a truncated call does not hide the next", truncated_then_valid, ["write_file", "glob"]),
+        ("ordinary prose markup is not a call", "<code>\nls\n</code>\n<description>list</description>", None),
+    ]
+    for label, raw, want in glyph_cases:
+        calls, _cleaned = extract_tool_calls(raw)
+        got = [c["function"]["name"] for c in calls] if calls else None
+        ok = got == want
+        print(f"{'ok  ' if ok else 'FAIL'} glyph {label}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {want!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -1628,6 +1790,7 @@ def _selftest() -> int:
         + len(hoist_cases)
         + len(repetition_cases)
         + len(downgrade_cases)
+        + len(glyph_cases)
         + 2
     )
     print(f"{total - failures}/{total} self-test cases passed")

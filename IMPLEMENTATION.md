@@ -181,6 +181,16 @@ value. The repair only succeeds when the result parses, so prose containing a br
 no call, and the extracted call then goes through the same `normalize_tool_call_dict` validation
 as any other. At most `len(stack)` closers are tried, and each is tried once.
 
+**The fragment must be bounded by the caller, not just by `repair_truncated_json`.** The repair
+cuts at the last structural character *in the text it is given*, so handing it the remainder of
+the completion puts every later call inside the fragment and the repair fails on bytes that were
+never part of the value. Observed live (2026-09-26): a `write_file` whose `}` was replaced by a
+mangled `</｜…>` never recovered, because six more calls followed it in the same completion.
+`_fragment_ends` now offers candidate ends at **closing-tag positions only** — interior braces are
+deliberately excluded, since a cut there yields a fragment that parses while having silently
+dropped part of the value, the one outcome this repair exists to avoid — and the caller resumes
+the scan *after* the repaired value rather than at the end of the text.
+
 ### 2.8 A parsed call that is missing a required parameter
 
 A call can parse perfectly and still be unusable. Captured live (2026-09-25, `gui-demo` session
@@ -411,11 +421,46 @@ upstream 500 drives this model into a loop, it will loop again and the answer fo
 still the truncated prose. The turn now survives and says so, which is the part the client could
 not do for itself.
 
-### 2.12 Self-test
+### 2.12 A tool call written in the wrong glyphs
+
+Past roughly **180 k tokens of context** this checkpoint starts losing ASCII: it writes the
+typographic quote `“`/`”` (U+201C/U+201D) where `"` belongs and the fullwidth bar `｜` (U+FF5C)
+where `|` belongs. To Python neither is a quote or a bar, so a `{"name": …}` object written in
+those glyphs is not JSON at all; `raw_decode` fails on the first one, `repair_truncated_json`
+returns `None` because the value is not merely truncated, and extraction yields **no calls** — the
+whole turn arrives at the client as prose. Captured live (2026-09-26) at **195 432 input tokens**:
+98 ASCII quotes, then at one exact offset everything after used `“ ”` (138) and `｜` (36), and all
+**seven** calls in the completion were lost. The turn did not abort (§2.11's downgrade held), so
+the model's output was a 5 525-character *description* of a `write_file` it never performed.
+
+Two mangles come from the same glyph loss and matter because they corrupt *parsing* rather than
+the JSON:
+
+* `</｜DSML｜_call>` — a stray closer with fullwidth bars. It is not DSML to `split_dsml_tag`, so
+  the keyword `_call` was read as a **tool name** (the same class as §2.8's `runtool_call`).
+* `<` `\` `｜DSML｜_placeholder>` — a backslash where the slash belongs, so a closer became an
+  opener and produced a call named `_placeholder`.
+
+Three defences, each an *alternative reading* rather than a rewrite, because the model's own glyphs
+must always win — an apostrophe in prose is legitimate text:
+
+* `fold_typographic()` maps `“ ” ‘ ’` to ASCII for a second attempt at each bracket. Folding is
+  hoisted out of the scan: the completion can be hundreds of KB and the scan visits every bracket.
+* `fold_dsml_syntax()` normalises only tags that actually carry a bar, an escape or a backslash, and
+  is a no-op for ordinary prose markup, so `<code>` cannot become a DSML call.
+* `classify_dsml_tag()` refuses to read a DSML tag as a call when it is a **closer**, or when its
+  keyword begins with `_` — no tool name starts with an underscore, and `_call`/`_placeholder` are
+  the tails of `tool_call`/`function_call` left behind by a truncated closer.
+
+**What this does not fix.** The proxy cannot stop the checkpoint losing ASCII, and a threshold at
+~180 k rests on one session. It can only stop misreading the result — which it now does: both
+captured payloads replay correctly (3 of 3 and 7 of 7 calls), so a lost turn becomes a slow one.
+
+### 2.13 Self-test
 
 The parser ships with fixtures for every dialect above, plus fixtures for the streaming hold-back
-window, for the brace repair, and for the repetition tail of §2.11 (60 cases). Run it after any
-change to the parser:
+window, for the brace repair, for the repetition tail of §2.11, and for the glyph loss of §2.12
+(68 cases). Run it after any change to the parser:
 
 ```bash
 ~/software/exllamav3-anemone/venv/bin/python tabby_proxy.py --selftest
