@@ -353,11 +353,11 @@ agree, and at the top of `process_message_tools_and_thinking` on both `content` 
 tool-call open tags…`, so the loop is visible in the journal instead of arriving as a silent empty
 answer — which is also why `tabby_watch.py` now watches for `repetition` and `tool-call`.
 
-**And to stop claiming one.** `finish_reason: "tool_calls"` with an empty call list is answered
-with `"stop"` on both paths (streaming and buffered), with a warning naming what upstream said, so
-a marker that could not be turned into a call degrades to plain text rather than an aborted turn.
-This is the same reasoning as the parser's other tolerance: the client's stop reason is a promise
-about the payload, and an unkept promise here costs the whole turn.
+**And to stop claiming a call it does not have.** `finish_reason: "tool_calls"` with an empty call
+list is answered with `"stop"` on both paths (streaming and buffered), with a warning naming what
+upstream said, so a marker that could not be turned into a call degrades to plain text rather than
+an aborted turn. This is the same reasoning as the parser's other tolerance: the client's stop
+reason is a promise about the payload, and an unkept promise here costs the whole turn.
 
 Two smaller additions go at the source and at the model:
 
