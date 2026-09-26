@@ -163,6 +163,7 @@ qwen --prompt "Solve 5 + 5"     # end-to-end through the proxy
 |---|---|
 | `README.md` (this file) | orientation: what it does, how to run it, how to tell it is working |
 | [IMPLEMENTATION.md](IMPLEMENTATION.md) | the detail: why each mount and flag is load-bearing, the service, the parser internals, the API key, the failure modes behind each design choice |
+| [SPECIFIC.md](SPECIFIC.md) | measurements from one real session (`ndlite`, 2026-09-26): the eight invented tool names, where they sit in a batch, and what did *not* fail |
 | `install.sh` | the executable form of both documents |
 | `LD-INSTALL.md` | **this machine only** — absolute paths, the GPU, and a log of the 2026-09-25 repairs. Deliberately git-ignored |
 | `tabby-proxy@.service`, `tabby_proxy.py` | the two artifacts that actually ship |

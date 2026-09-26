@@ -249,6 +249,20 @@ highlighting grammar (`invalid_comment_end`), and the name is absent from the se
 `tokenizer.json` `added_tokens` and from `chat_template.jinja`, so it is the model's own invention
 rather than a template artefact.
 
+The larger body of evidence is the 2026-09-26 `ndlite` probe: **8 inventions in 130 calls (6.15 %)**
+over 23 turns, every one empty-argument, every one absorbed by the client as `tool_not_registered`
+without aborting a turn. Two regularities there sharpen this section. **Every invention sat at
+position 0 of its batch** — 0 and 1 in the two turns that had two — never mid-batch and never last,
+across batch widths 2, 8, 9, 9, 13 and 28. And the names are not arbitrary: they divide into the
+**wire format's own vocabulary** (`tool_result`, `arguments`, `name`, `call` — the field names and
+content-block types of the tool protocol), **prose debris** (`on`, `ead`, `editing`, fragments of
+nearby English), and one **fused keyword pair** (`runtool_call`, from `run` plus `tool_call`).
+Position 0 is also the slot that stresses the streaming latch hardest, which is why §2.11's handling
+of a degenerate opener bears on this. Inventions tracked batch width rather than context depth there
+— but the wide batches also happened late, so the two are not separated by that session. The full
+measurements, the method to repeat them, and the observations that would falsify the position rule
+are in [SPECIFIC.md](SPECIFIC.md).
+
 The warning is what makes such a payload decidable: it fires on the name before the argument check is
 attempted, and with `TABBY_PROXY_RAW_LOG=1` it also dumps the raw payload — which is the only way to
 answer whether the invented call carried meaningful arguments or was empty. As with the parameter
