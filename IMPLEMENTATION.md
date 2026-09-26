@@ -216,7 +216,32 @@ With `TABBY_PROXY_RAW_LOG=1` the occurrence above is distinguishable: whether `f
 before `arguments` (model hoisted the parameter) or not at all (model omitted it). That is the
 question the name-only logging could not answer.
 
-### 2.9 Self-test
+### 2.9 Raw control characters inside a JSON string
+
+The extractor failed on a real turn on 2026-09-25 (session `0faa6605`) whose call looked well-formed
+but was invalid strict JSON: the `content` argument carried **literal newlines** rather than `\n`
+escapes. `json` rejects a raw control character inside a string (`Invalid control character`), so
+`raw_decode` failed, `extract_tool_calls` returned nothing, and the whole `<tool_call>` block was
+left in the content as prose.
+
+That is worse than a dropped call. **The client parses `<tool_call>` in text itself**, with a
+stricter parser; when the proxy does not convert the block, the raw text reaches the client and its
+own parser raises `malformed tool call` — the turn dies and the session stops abnormally. So a proxy
+parse failure of this shape is a lost session, not a lost file.
+
+The decoders now pass `strict=False`, which accepts raw control characters inside string values while
+leaving valid JSON behaviour unchanged. Three sites were relaxed: the JSON scanner and
+`repair_truncated_json` in `extract_tool_calls`, and the string-argument parse in `add_call`.
+Selftest cases cover a newline and a tab inside a string (44/44).
+
+**What this does not fix.** The same payload had a second defect: a git commit subject inside the
+string used unescaped `"` (`… e.g. \`3bffa9a\` "Add egui vs iced counter …`), which closes the
+string early and yields `Expecting ',' delimiter`. `strict=False` does not help there, and repairing
+it is genuinely ambiguous — an unescaped quote is indistinguishable from a real delimiter, so
+"fixing" it by merging could silently corrupt an argument. That case remains unrecovered; the honest
+options are to teach the model to escape (prompt-side) or to accept the loss.
+
+### 2.10 Self-test
 
 The parser ships with fixtures for every dialect above, plus fixtures for the streaming hold-back
 window and for the brace repair. Run it after any change to the parser:
@@ -680,6 +705,7 @@ Each of these actually happened, and each is now handled or documented.
 | `/stats` reports `0 / 0` tokens on tool turns | `stream_options` was dropped whenever tools were present | keep it, force `include_usage` (§2.6) |
 | context usage computed against 1000000 | the window was never declared, so a generic fallback was used | declare it on the provider entry (§7.1) |
 | `write_file` rejected with `invalid_tool_params: required property 'file_path'` | the model emitted the call with only `content` | proxy now warns with the missing key, and can dump the raw payload (§2.8) |
+| session halts with `malformed tool call` over a DSML tail | a raw control character (literal newline) inside the JSON string made the call unparseable, so the block reached the client as text | decoders accept control characters in strings (`strict=False`, §2.9) |
 
 ---
 

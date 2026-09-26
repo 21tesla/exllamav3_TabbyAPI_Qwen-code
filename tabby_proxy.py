@@ -460,11 +460,11 @@ def repair_truncated_json(text: str) -> Optional[Any]:
     Returns None when no bounded repair makes a value parse.
     """
     try:
-        return json.loads(text)
+        return json.loads(text, strict=False)
     except Exception:
         pass
 
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(strict=False)
     cuts = [len(text)]
     for pos in range(len(text) - 1, -1, -1):
         if text[pos] in ("}", "]", '"'):
@@ -555,7 +555,7 @@ def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str
             return
         if isinstance(args, str):
             try:
-                parsed = json.loads(args)
+                parsed = json.loads(args, strict=False)
                 args_str = json.dumps(parsed)
             except Exception:
                 args_str = args
@@ -599,7 +599,11 @@ def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str
 
 
     # 2. JSON objects/arrays scanning using raw_decode
-    decoder = json.JSONDecoder()
+    # strict=False tolerates the raw control characters the checkpoint
+    # sometimes leaves inside string values (see _log_tool_call_shapes' sibling
+    # note): a literal newline in a multi-line `content` is otherwise rejected
+    # as `Invalid control character` and the whole call is lost.
+    decoder = json.JSONDecoder(strict=False)
     start_pos = first_start if first_start < len(content) else 0
 
     idx = start_pos
@@ -640,7 +644,7 @@ def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str
         for pk, pv in re.findall(r"<parameter=([^>]+)>\s*(.*?)\s*(?:</parameter>|$)", fn_m.group(2), re.DOTALL):
             val = pv.strip()
             try:
-                params[pk.strip()] = json.loads(val)
+                params[pk.strip()] = json.loads(val, strict=False)
             except Exception:
                 params[pk.strip()] = val
         add_call(fn_name, params)
@@ -1268,7 +1272,46 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
-    total = len(cases) + len(marker_cases) + len(remainder_cases) + len(repair_cases) + 1
+    # A string value carrying raw control characters (a literal newline in a
+    # multi-line `content`) is invalid strict JSON, but is what the checkpoint
+    # actually emits. Captured live 2026-09-25: an extraction returned nothing
+    # over one such call, which then reached the client as raw text and halted
+    # the session on its own stricter parser.
+    control_cases = [
+        (
+            "newline inside a string",
+            '<tool_call>\n{"name": "write_file", "arguments": '
+            '{"file_path": "/tmp/a", "content": "one\ntwo"}}\n</tool_call>',
+            "write_file",
+            {"file_path": "/tmp/a", "content": "one\ntwo"},
+        ),
+        (
+            "tab inside a string",
+            '<tool_call>\n{"name": "grep_search", "arguments": '
+            '{"pattern": "a\tb"}}\n</tool_call>',
+            "grep_search",
+            {"pattern": "a\tb"},
+        ),
+    ]
+    for name, raw, want_name, want_args in control_cases:
+        got_calls, _ = extract_tool_calls(raw)
+        ok = bool(got_calls) and got_calls[0]["function"]["name"] == want_name
+        if ok:
+            got_args = json.loads(got_calls[0]["function"]["arguments"])
+            ok = got_args == want_args
+        print(f"{'ok  ' if ok else 'FAIL'} control char {name}")
+        if not ok:
+            failures += 1
+            print(f"     expected {want_name} {want_args!r}")
+
+    total = (
+        len(cases)
+        + len(marker_cases)
+        + len(remainder_cases)
+        + len(repair_cases)
+        + len(control_cases)
+        + 1
+    )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
 
