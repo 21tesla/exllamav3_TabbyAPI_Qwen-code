@@ -306,10 +306,79 @@ stored conversation state. Nothing in the prompt is a security boundary — it i
 that a hostile caller could equally influence — so treat the injected text as guidance, and keep the
 parser's own tolerance.
 
-### 2.11 Self-test
+### 2.11 A repetition tail of empty `<tool_call>` openers
+
+The checkpoint can end a completion in a run of opening tags with nothing inside them — no closer,
+no DSML, no JSON, no arguments. Captured live on 2026-09-26 in session `e8ee13a8` (project
+`analysis-qt6`), right after an upstream `500`: 913 generated tokens of
+
+```
+page` and the legs that touch it.
+<tool_call>
+<tool_call>
+...
+<tool_call>
+<tool
+```
+
+200 openers and a truncated 201st, and not one byte of a call among them. The same shape appears
+in `df6f0ecc` and in five older sessions, so it is a habit of this build rather than a one-off.
+
+It is not a DSML dialect and no parser can recover it, because there is nothing to recover: this is
+the sampler's repetition failure that §5.1 warns about, not a tool call. What made it expensive is
+the pair of *architectural* assumptions it collides with on the two sides of the proxy:
+
+* **In the proxy**, the marker latches the streaming hold-back, `extract_tool_calls` finds no call
+  in the text, and the only marker test in `process_message_tools_and_thinking` (`"DSML"`,
+  `"<tool_call"`, `"\\uff5c"`) fires the *warning* — leaving `finish_reason` untouched at
+  upstream's `"tool_calls"`.
+* **In Qwen Code**, that is the one combination the client cannot tolerate. `hasInvalidToolCallIndex
+  || hasNamelessToolCall || (finish_reason === "tool_calls" && completedToolCalls.length === 0)`
+  raises `InvalidStreamError("Model response contained a malformed tool call.", "MALFORMED_TOOL_CALL")`
+  and the turn dies. A completion whose content is pure noise ends the session.
+
+**The fix is to stop calling it a call.** `_strip_repetition_tail` finds the trailing run of
+openers — walking back from the end while only whitespace separates one from the next — and drops
+it, keeping whatever preceded it, which is the prose the turn actually produced. A run is exactly
+that and nothing more: the first gap that is not whitespace ends it, so an opener holding a JSON
+argument, or one preceded by a real `</tool_call>`, is untouched and still reaches the extractor.
+A stream cut mid-tag leaves a half-written `<tool` that can never be a call, so it is ignored when
+judging the run and dropped with it. If nothing precedes the run the result is an empty completion
+and the field is set to `None`, which also drops the raw markup from the answer.
+
+It runs in two places: inside `extract_tool_calls`, so extraction and the returned cleaned text
+agree, and at the top of `process_message_tools_and_thinking` on both `content` and
+`reasoning_content`, because those are the fields that reach the client. Both paths log
+`Dropped a repetition of empty tool-call open tags…` or `Completion was only repeated empty
+tool-call open tags…`, so the loop is visible in the journal instead of arriving as a silent empty
+answer — which is also why `tabby_watch.py` now watches for `repetition` and `tool-call`.
+
+**And to stop claiming one.** `finish_reason: "tool_calls"` with an empty call list is answered
+with `"stop"` on both paths (streaming and buffered), with a warning naming what upstream said, so
+a marker that could not be turned into a call degrades to plain text rather than an aborted turn.
+This is the same reasoning as the parser's other tolerance: the client's stop reason is a promise
+about the payload, and an unkept promise here costs the whole turn.
+
+Two smaller additions go at the source and at the model:
+
+* Three stop sequences joined to the list that already exists to break these loops — a second
+  opener directly after an empty one, in the newline, CRLF and adjacent forms. A real second call
+  is preceded by the first one's closer, so this cannot cut a genuine call; upstream then reports
+  `stop` rather than `tool_calls` and the client never sees the claim at all.
+* One line in the injected prompt (§2.10): every `<tool_call>` block must contain exactly one JSON
+  object, and the opening tag must never be repeated. A mitigation, not a guarantee, for the same
+  reason as the escaping rules.
+
+**What this does not fix.** The run is removed, not the cause: whatever sampling state after an
+upstream 500 drives this model into a loop, it will loop again and the answer for that turn is
+still the truncated prose. The turn now survives and says so, which is the part the client could
+not do for itself.
+
+### 2.12 Self-test
 
 The parser ships with fixtures for every dialect above, plus fixtures for the streaming hold-back
-window and for the brace repair. Run it after any change to the parser:
+window, for the brace repair, and for the repetition tail of §2.11 (60 cases). Run it after any
+change to the parser:
 
 ```bash
 ~/software/exllamav3-anemone/venv/bin/python tabby_proxy.py --selftest
@@ -773,6 +842,7 @@ Each of these actually happened, and each is now handled or documented.
 | session halts with `malformed tool call` over a DSML tail | a raw control character (literal newline) inside the JSON string made the call unparseable, so the block reached the client as text | decoders accept control characters in strings (`strict=False`, §2.9) |
 | session halts with `malformed tool call`, `Expecting ',' delimiter` | the model closed a JSON string early on an unescaped `"`; the quote is indistinguishable from a real delimiter, so repair would be guesswork | injected tool instructions now spell out `\"` / `\n` escaping (§2.10) |
 | a call vanishes with no error at all | the model emitted a name the request never declared (`comment_end` and friends) | proxy now warns that the client cannot dispatch it, and can dump the raw payload (§2.8) |
+| the session stops with `Model response contained a malformed tool call.` over pure tag noise | the model repeated empty `<tool_call>` openers after an upstream `500`; the proxy passed that on as `finish_reason: "tool_calls"` with no call, which the client aborts on | the run is dropped and the finish reason downgraded to `stop`; stop sequences end the loop at the source (§2.11) |
 
 ---
 
@@ -808,7 +878,12 @@ It reads two streams, both scoped to the local TabbyAPI path:
    instrument. `DeepSeek-V4-Flash-0731-exl3-2.32bpw` is TabbyAPI; `deepseek-v4.1-flash:cloud` is
    Ollama and is skipped entirely.
 2. **The proxy journal**, `journalctl --user -u <unit> -f`, filtered to non-2xx responses and error
-   lines.
+   lines. The keyword filter covers the proxy's own failure vocabulary — `retrying`, `traceback`,
+   `exception`, `upstream`, `malformed`, `tool-call`, `repetition` — and those last two are what
+   carry the parser's warnings, including the repetition tail of §2.11, into a notification. The
+   two are specific: every `tool-call` line in the journal to date is a `[WARNING]` (10 of 10), so
+   a client that prints call syntax into its own prose at `[INFO]` cannot spam the feed through
+   the new keywords.
 
 **What it reports, and what it deliberately does not.** A user-cancelled tool result is a decision,
 not a defect, so it is skipped. A detail string has its whitespace collapsed before printing,

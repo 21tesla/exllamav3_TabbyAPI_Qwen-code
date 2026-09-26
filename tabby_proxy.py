@@ -248,6 +248,8 @@ def inject_tools_into_messages(messages: list, tools: list) -> list:
         "- Escape every double quote inside a string value as \\\", and write a newline inside a string as \\n. Never emit a literal line break, tab, or other control character inside a string.\n"
         '- Worked example: to pass the text  print("hi")  then a new line  use the JSON string value  "print(\\"hi\\")\\n".\n'
         "- If you need to call multiple tools, you can output multiple <tool_call> blocks or a JSON array of tool calls.\n"
+        "- Every <tool_call> block must contain exactly one JSON object. Never emit an empty "
+        "block, and never repeat the opening tag.\n"
         "- You may explain your thoughts or insights before the <tool_call> block.\n"
         "- Close the last block with </tool_call> and stop there. Do not emit any further tags, tool outputs, or repeat closing tags.\n"
     )
@@ -584,10 +586,68 @@ def _log_tool_call_shapes(calls: Optional[List[dict]], raw: str, tools: Optional
                 logger.warning(f"Raw tool-call payload: {raw[:_RAW_MAX]!r}")
 
 
+# A repetition loop of *opening* tags with nothing inside them. Captured live
+# (2026-09-26, analysis-qt6 sessions e8ee13a8 and df6f0ecc) after an upstream 500:
+# a completion of ~900 tokens that is nothing but `<tool_call>` repeated, with no
+# closer, no DSML, no JSON and no arguments. There is no call in it, so it is
+# prose and must be treated as prose.
+_TOOL_CALL_OPEN_TAG_RE = re.compile(r"<\s*tool_calls?\s*>", re.IGNORECASE)
+
+
+def _strip_repetition_tail(text: Optional[str]) -> Optional[str]:
+    """Drop a trailing run of empty `<tool_call>` openers from `text`.
+
+    The run is a repetition loop, not a call: it holds no JSON, no argument and no
+    closer, so nothing in it can be dispatched. Only a run is removed -- an opener
+    with anything but further openers after it is left for the caller's extraction
+    to read as the marker it is, and the text before the run is returned intact
+    (the visible answer, which the client should still see).
+
+    Without this the run latches the streaming hold-back, `extract_tool_calls`
+    finds no call in it, and the turn is answered as `finish_reason:
+    "tool_calls"` with `tool_calls: null`. Qwen Code reads that pair as a
+    malformed call and aborts the turn, so a repetition loop costs a session.
+    """
+    if not text:
+        return text
+    # A stream cut mid-tag leaves a half-written opener (`<tool`); it can never
+    # become a call, so ignore it when judging what the run contains.
+    body = text
+    cut = text.rfind("<")
+    if cut != -1:
+        fragment = text[cut + 1:].strip().lower()
+        if fragment and ("tool_call".startswith(fragment) or "tool_calls".startswith(fragment)):
+            body = text[:cut]
+    if not body:
+        return text
+    # Walk the openers backwards from the end, extending the run while only
+    # whitespace separates one from the next. The first gap that holds anything
+    # else is the end of the run: whatever precedes it is left alone, so an opener
+    # that begins a real call still reaches the extraction.
+    run_start = None
+    for match in reversed(list(_TOOL_CALL_OPEN_TAG_RE.finditer(body))):
+        gap_end = run_start if run_start is not None else len(body)
+        if body[match.end():gap_end].strip():
+            break
+        run_start = match.start()
+    if run_start is None:
+        return text
+    stripped = body[:run_start].rstrip()
+    if not stripped:
+        # Nothing but the run: report it so the journal shows the loop rather
+        # than a silent empty completion. Bounded, since it can be huge.
+        logger.warning("Completion was only repeated empty tool-call open tags; dropping the repetition")
+        return None
+    logger.warning("Dropped a repetition of empty tool-call open tags after the visible answer")
+    return stripped
+
+
 def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str]]:
     """Robustly extracts tool calls from content in JSON, DSML, XML, or pseudo formats."""
     if not content:
         return None, content
+
+    content = _strip_repetition_tail(content) or ""
 
     tool_calls = []
     seen_sigs = set()
@@ -713,6 +773,12 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
     content = msg.get("content")
     reasoning = msg.get("reasoning_content")
 
+    # Both fields are sanitised here as well as inside extract_tool_calls, because
+    # this is what lands in `msg`: a repetition loop that yields no call has to be
+    # dropped from the answer the client sees, not left in it as raw markup.
+    content = _strip_repetition_tail(content)
+    reasoning = _strip_repetition_tail(reasoning)
+
     # If content has embedded <think>...</think> tags, extract them
     if content:
         if "<think>" in content:
@@ -760,6 +826,16 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
             logger.warning(f"Tool-call syntax present but unparsed: {raw[:300]!r}")
             if _RAW_LOG:
                 logger.warning(f"Raw unparsed completion: {raw[:_RAW_MAX]!r}")
+        # `tool_calls` with nothing in it is the one pair Qwen Code treats as a
+        # malformed call and aborts the turn on: the client sees a finish reason
+        # it cannot act on and stops the session. If the marker could not be
+        # turned into a call, answer as plain text instead, so the turn survives.
+        if choice.get("finish_reason") == "tool_calls":
+            logger.warning(
+                "Upstream said tool_calls but no call was parsed; reporting stop so the "
+                "client does not abort the turn on an empty call"
+            )
+            choice["finish_reason"] = "stop"
 
 
 # ---------------------------------------------------------------------------
@@ -1043,6 +1119,13 @@ async def chat_completions_proxy(request: Request):
         "\nTool Output:",
         "\nObservation:",
         "\n[Observation]",
+        # A second opener straight after an empty one is a loop, never two calls:
+        # a real second call is preceded by the first one's closer. Stopping here
+        # ends the run at the source, and upstream then reports `stop` rather than
+        # `tool_calls`, so the client never sees a call that is not one.
+        "<tool_call>\n<tool_call>",
+        "<tool_call>\r\n<tool_call>",
+        "<tool_call><tool_call>",
         "</ | DSML | tool_calls>",
         "</|DSML|tool_calls>",
         "</｜DSML｜tool_calls>",
@@ -1133,6 +1216,14 @@ async def chat_completions_proxy(request: Request):
         for choice in resp_data.get("choices", []):
             msg = choice.get("message", {})
             process_message_tools_and_thinking(msg, choice, tools)
+            # Same guard as the streaming path: a finish reason of `tool_calls`
+            # with an empty list is read as a malformed call and ends the turn.
+            if choice.get("finish_reason") == "tool_calls" and not msg.get("tool_calls"):
+                logger.warning(
+                    "Upstream said tool_calls but no call was parsed; reporting stop so the "
+                    "client does not abort the turn on an empty call"
+                )
+                choice["finish_reason"] = "stop"
 
         return Response(
             content=json.dumps(resp_data),
@@ -1413,6 +1504,63 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected {want_args!r}, got {got_args!r}")
 
+    # A run of empty `<tool_call>` openers with no closer is a repetition loop, not
+    # a call. Left alone it latches the hold-back, extracts nothing, and is
+    # answered as `finish_reason: "tool_calls"` with a null call list -- which Qwen
+    # Code aborts the turn on. Captured verbatim from session e8ee13a8 on
+    # 2026-09-26: 200 openers, no closer, no JSON.
+    loop_only = "<tool_call>\n" * 200 + "<tool"
+    loop_blob = "page` and the legs that touch it.\n" + loop_only
+    repetition_cases = [
+        ("pure loop is dropped", loop_only, None),
+        ("loop after prose keeps the prose", loop_blob, "page` and the legs that touch it."),
+        ("a single trailing opener is dropped", "All done.\n<tool_call>", "All done."),
+        ("a lone opener with no argument", "<tool_call>", None),
+        ("text after an opener is left alone", "Here:\n<tool_call>\nnothing", "Here:\n<tool_call>\nnothing"),
+        ("a run after a real call does not touch the call",
+         "Done.\n<tool_call>\n{\"name\": \"x\", \"arguments\": {}}\n</tool_call>\n<tool_call>\n<tool_call>",
+         "Done.\n<tool_call>\n{\"name\": \"x\", \"arguments\": {}}\n</tool_call>"),
+    ]
+    for name, raw, expected in repetition_cases:
+        got = _strip_repetition_tail(raw)
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} repetition {name}: {got!r}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
+    # The same blob must not produce a call, and must not claim one.
+    loop_calls, loop_cleaned = extract_tool_calls(loop_blob)
+    ok = loop_calls is None and loop_cleaned == "page` and the legs that touch it."
+    print(f"{'ok  ' if ok else 'FAIL'} repetition loop extracts no call: {loop_calls} cleaned={loop_cleaned!r}")
+    if not ok:
+        failures += 1
+
+    # A `tool_calls` finish reason that yielded no call is downgraded, in both the
+    # streaming and the buffered path, so the client does not abort the turn.
+    downgrade_cases = [
+        ("unparsed marker downgrades to stop", {"finish_reason": "tool_calls"}, "stop"),
+        ("a real call keeps tool_calls", {"finish_reason": "tool_calls", "has_call": True}, "tool_calls"),
+        ("a plain stop is untouched", {"finish_reason": "stop"}, "stop"),
+    ]
+    for name, scenario, expected in downgrade_cases:
+        msg = {"content": loop_blob, "reasoning_content": None}
+        if scenario.get("has_call"):
+            msg["content"] = '<tool_call>\n{"name": "read_file", "arguments": {"file_path": "/tmp/a"}}\n</tool_call>'
+        choice = {"finish_reason": scenario["finish_reason"]}
+        original_warning = logger.warning
+        logger.warning = lambda *a, **k: None
+        try:
+            process_message_tools_and_thinking(msg, choice, None)
+        finally:
+            logger.warning = original_warning
+        got = choice["finish_reason"]
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} finish reason {name}: {got!r}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -1421,7 +1569,9 @@ def _selftest() -> int:
         + len(control_cases)
         + len(name_cases)
         + len(hoist_cases)
-        + 1
+        + len(repetition_cases)
+        + len(downgrade_cases)
+        + 2
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0

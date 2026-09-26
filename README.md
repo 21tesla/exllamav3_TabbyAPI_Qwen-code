@@ -150,6 +150,7 @@ qwen --prompt "Solve 5 + 5"     # end-to-end through the proxy
 |---|---|
 | `422` on every request | the client is talking to `:5000` directly — route it through `:8081` |
 | `finish_reason: "tool_calls"` with no `tool_calls` | same: the DSML fix lives in the proxy |
+| the turn stops with `Model response contained a malformed tool call.` | the model looped on empty `<tool_call>` tags after a `500`; the proxy drops the run and reports `stop` instead of an empty call (§2.11 of [IMPLEMENTATION.md](IMPLEMENTATION.md)) |
 | `401 Invalid API key` | the key in `api_tokens.yml` and the client's key have diverged |
 | proxy answers `502`, upstream `000` | the TabbyAPI container is not running — `./install.sh tabby` |
 | OpenWebUI reports it cannot connect | its stored base URL, or the proxy is not bound to `0.0.0.0` |

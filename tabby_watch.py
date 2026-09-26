@@ -68,7 +68,7 @@ KNOWN_TOOLS = {
 }
 
 STATUS_RE = re.compile(r"HTTP/1\.1[^0-9]*(\d{3})")
-LOG_KEYWORDS = ("retrying", "traceback", "exception", "upstream", "malformed")
+LOG_KEYWORDS = ("retrying", "traceback", "exception", "upstream", "malformed", "tool-call", "repetition")
 
 
 def classify(rec):
