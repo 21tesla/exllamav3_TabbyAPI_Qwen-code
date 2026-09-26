@@ -239,9 +239,36 @@ string used unescaped `"` (`… e.g. \`3bffa9a\` "Add egui vs iced counter …`)
 string early and yields `Expecting ',' delimiter`. `strict=False` does not help there, and repairing
 it is genuinely ambiguous — an unescaped quote is indistinguishable from a real delimiter, so
 "fixing" it by merging could silently corrupt an argument. That case remains unrecovered; the honest
-options are to teach the model to escape (prompt-side) or to accept the loss.
+options are to teach the model to escape (prompt-side) or to accept the loss. The first of those is
+now implemented — see §2.10.
 
-### 2.10 Self-test
+### 2.10 Escaping instructions in the injected prompt
+
+The defect above is a *generation* defect, not a parsing one, so the durable fix is to ask for
+correct output rather than to guess at repair. The tool instructions the proxy injects into the
+system prompt used to carry a single line — "Always provide valid JSON for the arguments" — which is
+plainly not enough for a long `content` argument holding quotes and newlines.
+
+`inject_tools_into_messages` now states the rules concretely, and, because this is a quantised model
+serving long tool payloads, gives a worked example rather than an abstract rule:
+
+- the arguments must be one strict JSON object — no trailing commas, no comments;
+- a double quote inside a string value is written `\"` and a newline is written `\n`; a literal line
+  break, tab, or other control character inside a string is forbidden;
+- a worked example pairs the prose form `print("hi")` followed by a new line with the JSON string
+  value `"print(\"hi\")\n"`.
+
+This is a mitigation, not a guarantee: nothing verifies that the model obeys, so §2.9's parse
+tolerance and §2.7's brace repair still matter. Note that `strict=False` (§2.9) and escaping are
+complementary, not redundant — relaxing the decoder covers a *forgotten* newline escape, whereas only
+escaping covers a *forgotten* quote escape.
+
+The injected instructions are rebuilt on every request, so this change takes effect without touching
+stored conversation state. Nothing in the prompt is a security boundary — it is a request to a model
+that a hostile caller could equally influence — so treat the injected text as guidance, and keep the
+parser's own tolerance.
+
+### 2.11 Self-test
 
 The parser ships with fixtures for every dialect above, plus fixtures for the streaming hold-back
 window and for the brace repair. Run it after any change to the parser:
@@ -706,6 +733,7 @@ Each of these actually happened, and each is now handled or documented.
 | context usage computed against 1000000 | the window was never declared, so a generic fallback was used | declare it on the provider entry (§7.1) |
 | `write_file` rejected with `invalid_tool_params: required property 'file_path'` | the model emitted the call with only `content` | proxy now warns with the missing key, and can dump the raw payload (§2.8) |
 | session halts with `malformed tool call` over a DSML tail | a raw control character (literal newline) inside the JSON string made the call unparseable, so the block reached the client as text | decoders accept control characters in strings (`strict=False`, §2.9) |
+| session halts with `malformed tool call`, `Expecting ',' delimiter` | the model closed a JSON string early on an unescaped `"`; the quote is indistinguishable from a real delimiter, so repair would be guesswork | injected tool instructions now spell out `\"` / `\n` escaping (§2.10) |
 
 ---
 

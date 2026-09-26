@@ -240,10 +240,12 @@ def inject_tools_into_messages(messages: list, tools: list) -> list:
         '{"name": "tool_name", "arguments": {"param1": "value1"}}\n'
         "</tool_call>\n"
         "- Only call tools that are listed above.\n"
-        "- Always provide valid JSON for the arguments.\n"
+        "- The arguments must be strict JSON: one object, no trailing commas, no comments.\n"
+        "- Escape every double quote inside a string value as \\\", and write a newline inside a string as \\n. Never emit a literal line break, tab, or other control character inside a string.\n"
+        '- Worked example: to pass the text  print("hi")  then a new line  use the JSON string value  "print(\\"hi\\")\\n".\n'
         "- If you need to call multiple tools, you can output multiple <tool_call> blocks or a JSON array of tool calls.\n"
         "- You may explain your thoughts or insights before the <tool_call> block.\n"
-        "- Immediately after outputting the tool call block(s), end your turn with </tool_call>. Do not hallucinate tool outputs.\n"
+        "- Close the last block with </tool_call> and stop there. Do not emit any further tags, tool outputs, or repeat closing tags.\n"
     )
 
     out_messages = []
