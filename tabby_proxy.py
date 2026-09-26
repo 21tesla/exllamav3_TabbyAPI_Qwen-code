@@ -487,6 +487,57 @@ def repair_truncated_json(text: str) -> Optional[Any]:
     return None
 
 
+_RAW_LOG = os.getenv("TABBY_PROXY_RAW_LOG", "").strip().lower() in ("1", "true", "yes", "on")
+_RAW_MAX = int(os.getenv("TABBY_PROXY_RAW_LOG_CHARS", "20000") or "20000")
+
+
+def _tool_required_params(name: str, tools: Optional[list]) -> Optional[set]:
+    """Required argument names the request declares for `name`, else None if unknown."""
+    if not tools:
+        return None
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        func = tool.get("function")
+        if not isinstance(func, dict) or func.get("name") != name:
+            continue
+        schema = func.get("parameters")
+        if isinstance(schema, dict) and isinstance(schema.get("required"), list):
+            return set(schema["required"])
+        return set()
+    return None
+
+
+def _log_tool_call_shapes(calls: Optional[List[dict]], raw: str, tools: Optional[list]) -> None:
+    """Flag extracted calls that dropped a parameter the request's schema requires.
+
+    A call can parse cleanly and still be unusable -- the model occasionally emits
+    an argument outside the arguments object, or omits it outright, and the client
+    rejects the call with `invalid_tool_params`. Comparing against the schema the
+    request itself declared catches that here, where the source is identifiable.
+    """
+    for call in calls or []:
+        func = call.get("function") or {}
+        name = func.get("name")
+        try:
+            args = json.loads(func.get("arguments") or "{}")
+        except Exception:
+            continue
+        if not isinstance(args, dict):
+            continue
+        required = _tool_required_params(name, tools)
+        if required is None:
+            continue
+        missing = sorted(required - set(args))
+        if missing:
+            logger.warning(
+                f"Tool call {name} is missing required parameter(s) {missing}; "
+                f"emitted keys were {sorted(args)}"
+            )
+            if _RAW_LOG:
+                logger.warning(f"Raw tool-call payload: {raw[:_RAW_MAX]!r}")
+
+
 def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str]]:
     """Robustly extracts tool calls from content in JSON, DSML, XML, or pseudo formats."""
     if not content:
@@ -607,7 +658,7 @@ def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str
     return None, content
 
 
-def process_message_tools_and_thinking(msg: dict, choice: dict):
+def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[list] = None):
     """Parses thinking tags and extracts tool calls from message content or reasoning_content."""
     content = msg.get("content")
     reasoning = msg.get("reasoning_content")
@@ -637,6 +688,7 @@ def process_message_tools_and_thinking(msg: dict, choice: dict):
             msg["tool_calls"] = extracted_calls
             msg["content"] = cleaned_content
             choice["finish_reason"] = "tool_calls"
+            _log_tool_call_shapes(extracted_calls, content, tools)
             logger.info(f"Intercepted and parsed {len(extracted_calls)} tool call(s) from content: {[c['function']['name'] for c in extracted_calls]}")
             return
 
@@ -647,6 +699,7 @@ def process_message_tools_and_thinking(msg: dict, choice: dict):
             msg["tool_calls"] = extracted_calls
             msg["reasoning_content"] = cleaned_reasoning
             choice["finish_reason"] = "tool_calls"
+            _log_tool_call_shapes(extracted_calls, reasoning, tools)
             logger.info(f"Intercepted and parsed {len(extracted_calls)} tool call(s) from reasoning: {[c['function']['name'] for c in extracted_calls]}")
             return
 
@@ -655,6 +708,8 @@ def process_message_tools_and_thinking(msg: dict, choice: dict):
         raw = content or reasoning or ""
         if "DSML" in raw or "<tool_call" in raw or "\\uff5c" in raw:
             logger.warning(f"Tool-call syntax present but unparsed: {raw[:300]!r}")
+            if _RAW_LOG:
+                logger.warning(f"Raw unparsed completion: {raw[:_RAW_MAX]!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -802,7 +857,7 @@ async def relay_upstream_stream(stream_ctx, response, client: httpx.AsyncClient)
         await client.aclose()
 
 
-async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient, requested_model: Optional[str]) -> AsyncIterator[str]:
+async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient, requested_model: Optional[str], tools: Optional[list] = None) -> AsyncIterator[str]:
     """Relay a tool-bearing completion as SSE, intercepting native tool syntax."""
     resp_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     created = int(time.time())
@@ -875,7 +930,7 @@ async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient,
 
     message = {"role": "assistant", "content": content_text or None, "reasoning_content": reasoning_text or None}
     choice = {"index": index, "finish_reason": finish_reason}
-    process_message_tools_and_thinking(message, choice)
+    process_message_tools_and_thinking(message, choice, tools)
     final_content = message.get("content")
     final_reasoning = message.get("reasoning_content")
     tool_calls = message.get("tool_calls")
@@ -1001,7 +1056,7 @@ async def chat_completions_proxy(request: Request):
 
         if has_tools:
             return StreamingResponse(
-                stream_tools_response(stream_ctx, response, client, requested_model),
+                stream_tools_response(stream_ctx, response, client, requested_model, tools),
                 media_type="text/event-stream"
             )
 
@@ -1027,7 +1082,7 @@ async def chat_completions_proxy(request: Request):
         # Parse message content / reasoning for tool calls
         for choice in resp_data.get("choices", []):
             msg = choice.get("message", {})
-            process_message_tools_and_thinking(msg, choice)
+            process_message_tools_and_thinking(msg, choice, tools)
 
         return Response(
             content=json.dumps(resp_data),

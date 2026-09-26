@@ -181,7 +181,42 @@ value. The repair only succeeds when the result parses, so prose containing a br
 no call, and the extracted call then goes through the same `normalize_tool_call_dict` validation
 as any other. At most `len(stack)` closers are tried, and each is tried once.
 
-### 2.8 Self-test
+### 2.8 A parsed call that is missing a required parameter
+
+A call can parse perfectly and still be unusable. Captured live (2026-09-25, `gui-demo` session
+`0faa6605`): two `write_file` calls arrived as `{"content": "..."}` with `file_path` absent, so
+Qwen Code rejected both with `invalid_tool_params` and the two clock files were not written. The
+same session emitted the identical tool correctly one turn earlier and again on the retry that
+followed, so the model was the source; the point is that the proxy had no way to say so.
+
+The proxy logs the tool *names* it parsed, never the arguments — which made this failure
+undecidable after the fact. Two additions fix that:
+
+`_log_tool_call_shapes(calls, raw, tools)` compares each call's emitted keys against the
+`required` list the request itself declared for that tool. A missing one is logged as
+
+```
+[WARNING] Tool call write_file is missing required parameter(s) ['file_path']; emitted keys were ['content']
+```
+
+The check is silent when the request declared no schema for that tool name (nothing to compare
+against) and when no `tools` were sent at all — so it produces no noise for the Ollama-style
+passthrough path or for `write_file`-shaped calls that are in fact complete. `process_message_tools_and_thinking`
+now takes the request's `tools` and forwards it; both the buffered call site and
+`stream_tools_response` pass it.
+
+Optional verbose capture, off by default because raw completion text is untrusted model output:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `TABBY_PROXY_RAW_LOG` | off | With `1`/`true`/`yes`/`on`, append the raw payload to each shape warning and to the existing "tool-call syntax present but unparsed" warning. |
+| `TABBY_PROXY_RAW_LOG_CHARS` | `20000` | Cap on characters dumped per warning, so one pathological completion cannot flood the journal. |
+
+With `TABBY_PROXY_RAW_LOG=1` the occurrence above is distinguishable: whether `file_path` appears
+before `arguments` (model hoisted the parameter) or not at all (model omitted it). That is the
+question the name-only logging could not answer.
+
+### 2.9 Self-test
 
 The parser ships with fixtures for every dialect above, plus fixtures for the streaming hold-back
 window and for the brace repair. Run it after any change to the parser:
@@ -644,6 +679,7 @@ Each of these actually happened, and each is now handled or documented.
 | a turn dies with `malformed tool call` | the model ended the call's JSON one brace early | bounded brace repair before giving up (§2.7) |
 | `/stats` reports `0 / 0` tokens on tool turns | `stream_options` was dropped whenever tools were present | keep it, force `include_usage` (§2.6) |
 | context usage computed against 1000000 | the window was never declared, so a generic fallback was used | declare it on the provider entry (§7.1) |
+| `write_file` rejected with `invalid_tool_params: required property 'file_path'` | the model emitted the call with only `content` | proxy now warns with the missing key, and can dump the raw payload (§2.8) |
 
 ---
 
