@@ -65,6 +65,10 @@ _ATTR_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*[\"\x27]([^\"\x27]*)[\"\x27]")
 _CALL_TAGS = {"tool_call", "tool_calls", "tool", "invoke", "function", "function_call"}
 _PARAM_TAGS = {"parameter", "param"}
 _CALL_NAME_KEYS = {"name", "tool", "tool_name", "function"}
+# Keys that describe a call rather than populate its arguments. A sibling key that
+# is not one of these and not the arguments container is a parameter the model left
+# outside `arguments`; see normalize_tool_call_dict.
+_CALL_META_KEYS = {"name", "function", "tool", "tool_name", "action", "type", "id"}
 
 
 def unescape_dsml(text: str) -> str:
@@ -401,13 +405,27 @@ def normalize_tool_call_dict(d: dict) -> Tuple[Optional[str], Any]:
         return None, None
 
     args = None
+    args_key = None
     for k in ("arguments", "parameters", "args", "input", "action_input"):
         if k in d:
             args = d[k]
+            args_key = k
             break
     if args is None:
-        other_keys = {k: v for k, v in d.items() if k not in ("name", "function", "tool", "action", "type", "id")}
+        other_keys = {k: v for k, v in d.items() if k not in _CALL_META_KEYS}
         args = other_keys if other_keys else {}
+    elif isinstance(args, dict):
+        # The model sometimes hoists a parameter *out* of `arguments` and leaves it
+        # as a sibling key, e.g. {"name": …, "arguments": {"content": …},
+        # "file_path": …}. Taking `arguments` verbatim drops it, so the client sees
+        # a call missing a required property. Fold the siblings back in, never
+        # overwriting a key the model did place inside `arguments`.
+        hoisted = {
+            k: v for k, v in d.items()
+            if k not in _CALL_META_KEYS and k != args_key and k not in args
+        }
+        if hoisted:
+            args = {**args, **hoisted}
     return name, args
 
 
@@ -1367,6 +1385,34 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected warning={want_warning}, captured {captured!r}")
 
+    # The model sometimes leaves a parameter beside `arguments` instead of inside
+    # it. Taking `arguments` verbatim dropped it, and the client then rejected the
+    # call with `invalid_tool_params`. Captured live as a missing `file_path`.
+    hoist_cases = [
+        (
+            "hoisted sibling is folded in",
+            {"name": "write_file", "arguments": {"content": "x"}, "file_path": "/tmp/a"},
+            {"content": "x", "file_path": "/tmp/a"},
+        ),
+        (
+            "sibling never overwrites an inner key",
+            {"name": "write_file", "arguments": {"file_path": "/inner"}, "file_path": "/outer"},
+            {"file_path": "/inner"},
+        ),
+        (
+            "meta keys are not mistaken for parameters",
+            {"name": "write_file", "type": "function", "id": "c1", "arguments": {"content": "x"}},
+            {"content": "x"},
+        ),
+    ]
+    for label, shape, want_args in hoist_cases:
+        _, got_args = normalize_tool_call_dict(shape)
+        ok = got_args == want_args
+        print(f"{'ok  ' if ok else 'FAIL'} {label}")
+        if not ok:
+            failures += 1
+            print(f"     expected {want_args!r}, got {got_args!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -1374,6 +1420,7 @@ def _selftest() -> int:
         + len(repair_cases)
         + len(control_cases)
         + len(name_cases)
+        + len(hoist_cases)
         + 1
     )
     print(f"{total - failures}/{total} self-test cases passed")

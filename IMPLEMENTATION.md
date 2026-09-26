@@ -214,7 +214,25 @@ Optional verbose capture, off by default because raw completion text is untruste
 
 With `TABBY_PROXY_RAW_LOG=1` the occurrence above is distinguishable: whether `file_path` appears
 before `arguments` (model hoisted the parameter) or not at all (model omitted it). That is the
-question the name-only logging could not answer.
+question the name-only logging could not answer — and the first of those two shapes is now
+*recovered* rather than merely reported; see below.
+
+**A hoisted parameter is folded back in.** `normalize_tool_call_dict` used to take `arguments`
+verbatim whenever it was present, silently dropping a parameter the model left beside it:
+
+```json
+{"name": "write_file", "arguments": {"content": "x"}, "file_path": "/tmp/a"}
+```
+
+That is a call the client rejects with `invalid_tool_params` even though the model did supply the
+value. Sibling keys that are not call *metadata* (`_CALL_META_KEYS`: `name`, `function`, `tool`,
+`tool_name`, `action`, `type`, `id`) and not the arguments container itself are now merged into
+`arguments`, with an inner key always winning — so a value the model placed correctly is never
+overwritten by a stray sibling. The branch is `dict`-guard only, leaving `arguments`-as-JSON-string
+untouched, because merging siblings into a string would produce invalid JSON.
+
+Note the ordering of the two mechanisms: recovery happens here, so the §2.8 warning fires only for a
+call that *omitted* the parameter outright, or whose string-form arguments cannot be merged.
 
 **Names the request never declared.** The same check now also compares each extracted call's *name*
 against the names the request declared:
@@ -751,7 +769,7 @@ Each of these actually happened, and each is now handled or documented.
 | a turn dies with `malformed tool call` | the model ended the call's JSON one brace early | bounded brace repair before giving up (§2.7) |
 | `/stats` reports `0 / 0` tokens on tool turns | `stream_options` was dropped whenever tools were present | keep it, force `include_usage` (§2.6) |
 | context usage computed against 1000000 | the window was never declared, so a generic fallback was used | declare it on the provider entry (§7.1) |
-| `write_file` rejected with `invalid_tool_params: required property 'file_path'` | the model emitted the call with only `content` | proxy now warns with the missing key, and can dump the raw payload (§2.8) |
+| `write_file` rejected with `invalid_tool_params: required property 'file_path'` | the model emitted the call with only `content` | the proxy folds a hoisted sibling parameter back into `arguments`, and warns when one is missing outright (§2.8) |
 | session halts with `malformed tool call` over a DSML tail | a raw control character (literal newline) inside the JSON string made the call unparseable, so the block reached the client as text | decoders accept control characters in strings (`strict=False`, §2.9) |
 | session halts with `malformed tool call`, `Expecting ',' delimiter` | the model closed a JSON string early on an unescaped `"`; the quote is indistinguishable from a real delimiter, so repair would be guesswork | injected tool instructions now spell out `\"` / `\n` escaping (§2.10) |
 | a call vanishes with no error at all | the model emitted a name the request never declared (`comment_end` and friends) | proxy now warns that the client cannot dispatch it, and can dump the raw payload (§2.8) |
