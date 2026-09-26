@@ -91,7 +91,7 @@ Did you mean one of: "…"?
 Proxy side, for each of them, the same two lines in this order:
 
 ```
-[WARNING] Tool call 'X' is not one of the 20 tools this request declared; the client cannot dispatch it
+[WARNING] Tool call 'X' is not one of the 20 tools this request declared (batch=9); the client cannot dispatch it
 [INFO]    Intercepted and parsed N tool call(s) from content: ['X', 'read_file', …]
 ```
 
@@ -218,6 +218,11 @@ These are the results that make the proxy look healthy, and each is a counter th
 * **The 28-call batch decoded intact**, junk stub at #0 included, with all 27 legitimate calls
   dispatched and the turn surviving. Before §2.11, a malformed opener in that position is what
   produced the original abort.
+* **The model declined to invent when asked to.** A live request (2026-09-26, after the session)
+  declaring only `read_file` and asking the model to run `ls` produced
+  `"I'm sorry, but I don't have a tool available to execute shell commands like \`ls\`"` with
+  `finish_reason: stop` — no invented name and no empty call. The nine inventions came from the
+  model's own tool choice mid-task, not from a prompt naming a tool that does not exist.
 
 ## 8. Three content errors, which are a different class
 
@@ -268,20 +273,31 @@ disprove the tidy width-only story.
 
 ## 10. Instrumentation gaps
 
-*   `TABBY_PROXY_RAW_LOG` was **not** set, so none of the nine payloads was captured at the wire.
-    §2.8 is explicit that this is the only way to answer whether an invented call carried meaningful
-    arguments, and here the emptiness is inferred from the extraction rather than observed. Arming
-    it needs a restart — `_RAW_LOG` is read at import (line 512) — which was deliberately not done
-    mid-session. `TABBY_PROXY_RAW_LOG_CHARS` (20000) already bounds the dump.
-*   **Batch width is not recorded anywhere.** It is derivable from the transcript but not emitted by
-    the proxy, so the width-vs-depth question in §6 cannot be settled without post-hoc transcript
-    work. A one-field addition to the undeclared-name warning (`batch=<n>`) would make it a
-    journal-side measurement, and would turn §6's open question into a query.
+*   ~~`TABBY_PROXY_RAW_LOG` was not set.~~ **Armed 2026-09-26** in `~/.config/tabby-proxy.env` (with
+    a backup of the file beside it), so the next probe captures invented payloads at the wire without
+    needing to be set up in advance. Note the earlier observation: it is read at import (line 512),
+    so arming it needs a restart, and `./install.sh proxy` will not rewrite the file. Verified live
+    rather than assumed — asking the model for an empty `arguments` object produced both lines:
+
+    ```
+    [WARNING] Tool call read_file is missing required parameter(s) ['file_path']; emitted keys were []
+    [WARNING] Raw tool-call payload: '<tool_call>\n{"name": "read_file", "arguments": {}}\n</tool_call>'
+    ```
+
+    That payload is a *declared* name, so it does not answer the invented-name question — it proves
+    the mechanism fires and shows the wire format, which is what a future probe needs.
+*   ~~**Batch width is not recorded anywhere.**~~ **Corrected — it was, and now it is in the warning
+    too.** The width was always available as the `N` in `Intercepted and parsed N tool call(s)` (and
+    the ordered name list on the same line), so §6's correlation was already answerable from the
+    journal — this section overstated the gap. As of 2026-09-26 the undeclared-name warning also
+    carries `batch=<n>`, so the invented-name row and the width are one row instead of two that must
+    be joined by timestamp. What remains genuinely unrecorded is the *depth*, below.
 *   **Context depth is not visible to the observer at all.** The 115 000-token figure came from the
     user reading the client UI. Nothing in the transcript or the journal reports it, so any depth
     correlation has to be assembled by hand from user-supplied readings. The transcript's byte size
     is not a proxy for it — it was 984 KB at 115 k tokens but holds every tool result verbatim, and
-    those are re-sent each turn.
+    those are re-sent each turn. This is the one instrumentation gap that §13's item 3 cannot work
+    around.
 *   `tabby_watch.py` reports a nonzero-exit `run_shell_command` as `[TOOL_ERROR]` with no way to
     tell "the tool broke" from "the exit code is the answer" (`diff`, `grep -q`, `assert`). The
     output body's presence is an imperfect discriminator; `assert` fails with no output and *should*
@@ -345,17 +361,28 @@ whether this failure mode needs a fix: at this rate it is noise the client absor
 ## 13. What would settle the open questions
 
 The two unresolved questions are §6's mechanism and §11's depth contribution. Both need the same
-instrument, so they should be settled together:
+instrument, so they should be settled together. **Items 1 and 2 are done as of 2026-09-26** — armed
+and shipped, waiting on the next session:
 
-1. **Arm `TABBY_PROXY_RAW_LOG=1` before the session starts.** This captures the invented payload at
-   the wire, which is the only way to know whether the stub is a bare `<tool_call>` with nothing in
-   it or carries a partial JSON body the extractor dropped.
-2. **Add `batch=<n>` to the undeclared-name warning.** Then §6 becomes a journal query rather than
-   transcript archaeology, and the width/depth confound can be broken by holding one fixed.
+1. ~~**Arm `TABBY_PROXY_RAW_LOG=1` before the session starts.**~~ **Done** — set in
+   `~/.config/tabby-proxy.env`, proxy restarted, flag confirmed present in the running process's
+   environment and confirmed live by a request that produced a raw dump. It captures the invented
+   payload at the wire, which is the only way to know whether the stub is a bare `<tool_call>` with
+   nothing in it or carries a partial JSON body the extractor dropped.
+2. ~~**Add `batch=<n>` to the undeclared-name warning.**~~ **Done** — shipped, with self-test cases
+   for width 1 and width 3. §6 is now a journal query rather than transcript archaeology.
 3. **Run two sessions with the same batch profile at different context depths** — e.g. the same
    "read these N files in parallel" opening at ~10 k and at ~200 k tokens. If the stub rate is the
    same, it is width; if it rises, it is depth. This session had them confounded in one direction
-   and gave an ambiguous hint in the other.
+   and gave an ambiguous hint in the other. *Still the only way to settle §6; note that no
+   instrumentation can supply the depth reading — it has to come from the client UI.*
 4. **Watch for a non-empty invented call.** All nine were `{}`. A stub with arguments would be a
    different failure — the model would have had a target in mind — and it would change which
-   code path is worth hardening.
+   code path is worth hardening. *Item 1's armed dump now makes this decidable on first sight.*
+
+An incidental result of building this: the model **declines** rather than inventing when asked
+directly. A request to run `ls` with only `read_file` declared produced
+`"I'm sorry, but I don't have a tool available to execute shell commands like \`ls\`"` and a plain
+`stop` — no invented name. Nine for nine inventions came from the model's *own* choice of tool
+during real work; it does not manufacture one on demand. Reproducing the failure therefore needs a
+genuine task, not a prompt that names a fake tool.

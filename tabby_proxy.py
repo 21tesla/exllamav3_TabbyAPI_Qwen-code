@@ -556,13 +556,17 @@ def _log_tool_call_shapes(calls: Optional[List[dict]], raw: str, tools: Optional
     `invalid_tool_params`. Both are detectable here, where the source is identifiable.
     """
     declared = _declared_tool_names(tools)
+    batch = len(calls or [])
     for call in calls or []:
         func = call.get("function") or {}
         name = func.get("name")
         if declared is not None and name not in declared:
+            # The batch size goes in the warning so a row is self-describing: the
+            # count is otherwise only in the separate INFO line, and the width is
+            # what a query wants to correlate against (SPECIFIC.md 6).
             logger.warning(
                 f"Tool call {name!r} is not one of the {len(declared)} tools this request "
-                f"declared; the client cannot dispatch it"
+                f"declared (batch={batch}); the client cannot dispatch it"
             )
             if _RAW_LOG:
                 logger.warning(f"Raw tool-call payload: {raw[:_RAW_MAX]!r}")
@@ -1476,6 +1480,57 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected warning={want_warning}, captured {captured!r}")
 
+    # The warning carries the batch width so one journal row answers both "which
+    # invented name" and "how wide was the turn that produced it" -- without it
+    # the width lives only in the separate INFO line, and a query correlating
+    # width against invention (SPECIFIC.md 6) has to join two rows by hand. The
+    # raw dump is a third row and must not stand in for the warning.
+    width_cases = [
+        (
+            "batch width appears in the warning",
+            [{"function": {"name": name}} for name in ("comment_end", "write_file", "glob")],
+            "batch=3",
+        ),
+        (
+            "a lone invented call reports width 1",
+            [{"function": {"name": "comment_end"}}],
+            "batch=1",
+        ),
+    ]
+    for label, calls_arg, want_substring in width_cases:
+        captured: List[str] = []
+        original_warning = logger.warning
+        logger.warning = lambda message, *a, **k: captured.append(str(message))
+        try:
+            _log_tool_call_shapes(calls_arg, "raw", name_tools)
+        finally:
+            logger.warning = original_warning
+        ok = any(want_substring in message for message in captured)
+        print(f"{'ok  ' if ok else 'FAIL'} {label}")
+        if not ok:
+            failures += 1
+            print(f"     expected {want_substring!r} in {captured!r}")
+
+    # TABBY_PROXY_RAW_LOG gates every raw dump because a dump is `_RAW_MAX` chars
+    # -- 20 000 by default -- per occurrence, and it captures the payload that
+    # contains an invented name. With it off, the decoded warning above still
+    # answers the shape questions; only the wire bytes need the flag.
+    raw_log_captured: List[str] = []
+    original_warning = logger.warning
+    logger.warning = lambda message, *a, **k: raw_log_captured.append(str(message))
+    try:
+        _log_tool_call_shapes([{"function": {"name": "comment_end"}}], "WIRE-PAYLOAD", name_tools)
+    finally:
+        logger.warning = original_warning
+    raw_logged = any("WIRE-PAYLOAD" in message for message in raw_log_captured)
+    ok = raw_logged == _RAW_LOG
+    print(
+        f"{'ok  ' if ok else 'FAIL'} raw dump follows the TABBY_PROXY_RAW_LOG flag: "
+        f"flag={_RAW_LOG}, dumped={raw_logged}"
+    )
+    if not ok:
+        failures += 1
+
     # The model sometimes leaves a parameter beside `arguments` instead of inside
     # it. Taking `arguments` verbatim dropped it, and the client then rejected the
     # call with `invalid_tool_params`. Captured live as a missing `file_path`.
@@ -1568,6 +1623,8 @@ def _selftest() -> int:
         + len(repair_cases)
         + len(control_cases)
         + len(name_cases)
+        + len(width_cases)
+        + 1
         + len(hoist_cases)
         + len(repetition_cases)
         + len(downgrade_cases)

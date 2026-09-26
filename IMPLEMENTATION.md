@@ -209,8 +209,23 @@ Optional verbose capture, off by default because raw completion text is untruste
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `TABBY_PROXY_RAW_LOG` | off | With `1`/`true`/`yes`/`on`, append the raw payload to each shape warning and to the existing "tool-call syntax present but unparsed" warning. |
+| `TABBY_PROXY_RAW_LOG` | off | With `1`/`true`/`yes`/`on`, append the raw payload to each shape warning and to the existing "tool-call syntax present but unparsed" warning. **Armed on this machine** for the next probe; see below. |
 | `TABBY_PROXY_RAW_LOG_CHARS` | `20000` | Cap on characters dumped per warning, so one pathological completion cannot flood the journal. |
+
+It is read once at import, so turning it on or off needs a restart — the flag cannot be toggled on a
+running proxy. On this machine it is armed in `~/.config/tabby-proxy.env` rather than in the shell,
+so it survives restarts and is visible to the unit; `./install.sh proxy` does **not** rewrite that
+file, so the setting persists across repairs. The dump is a second journal line, not part of the
+decoded warning:
+
+```
+[WARNING] Tool call read_file is missing required parameter(s) ['file_path']; emitted keys were []
+[WARNING] Raw tool-call payload: '<tool_call>\n{"name": "read_file", "arguments": {}}\n</tool_call>'
+```
+
+Both lines were captured live (2026-09-26) by asking the model for an empty `arguments` object. The
+decoded line needs no flag — only the wire bytes do, which is why the flag matters for a question
+the decoded line cannot answer: what an *invented* name carried.
 
 With `TABBY_PROXY_RAW_LOG=1` the occurrence above is distinguishable: whether `file_path` appears
 before `arguments` (model hoisted the parameter) or not at all (model omitted it). That is the
@@ -238,8 +253,14 @@ call that *omitted* the parameter outright, or whose string-form arguments canno
 against the names the request declared:
 
 ```
-[WARNING] Tool call 'comment_end' is not one of the 14 tools this request declared; the client cannot dispatch it
+[WARNING] Tool call 'comment_end' is not one of the 14 tools this request declared (batch=9); the client cannot dispatch it
 ```
+
+The `batch=<n>` suffix is the number of calls the completion yielded in total, invented ones
+included. It costs nothing to emit and it makes the row self-describing: the width of the turn that
+produced the stub is the variable worth correlating against, and without it that number lives only
+in the separate `Intercepted and parsed N tool call(s)` INFO line, so a query has to join two rows
+by hand (SPECIFIC.md §6).
 
 This is the one failure shape the parameter check structurally cannot see, because an unknown name
 has no schema to compare its arguments against. The model has been observed inventing one-off names
