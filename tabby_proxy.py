@@ -510,17 +510,43 @@ def _tool_required_params(name: str, tools: Optional[list]) -> Optional[set]:
     return None
 
 
-def _log_tool_call_shapes(calls: Optional[List[dict]], raw: str, tools: Optional[list]) -> None:
-    """Flag extracted calls that dropped a parameter the request's schema requires.
+def _declared_tool_names(tools: Optional[list]) -> Optional[set]:
+    """Tool names the request declares, else None if the request declared none."""
+    if not tools:
+        return None
+    names = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        func = tool.get("function")
+        if isinstance(func, dict) and func.get("name"):
+            names.add(func["name"])
+    return names or None
 
-    A call can parse cleanly and still be unusable -- the model occasionally emits
-    an argument outside the arguments object, or omits it outright, and the client
-    rejects the call with `invalid_tool_params`. Comparing against the schema the
-    request itself declared catches that here, where the source is identifiable.
+
+def _log_tool_call_shapes(calls: Optional[List[dict]], raw: str, tools: Optional[list]) -> None:
+    """Flag extracted calls the client cannot dispatch, or that dropped a required parameter.
+
+    Two shapes are worth a warning. A call whose *name* is not among the tools the
+    request declared cannot be dispatched at all -- the model invented a name such
+    as `comment_end`, and the schema comparison below cannot see it, because an
+    unknown name has no schema to compare against. A call whose name *is* declared
+    can still be unusable: the model occasionally emits an argument outside the
+    arguments object, or omits it outright, and the client rejects the call with
+    `invalid_tool_params`. Both are detectable here, where the source is identifiable.
     """
+    declared = _declared_tool_names(tools)
     for call in calls or []:
         func = call.get("function") or {}
         name = func.get("name")
+        if declared is not None and name not in declared:
+            logger.warning(
+                f"Tool call {name!r} is not one of the {len(declared)} tools this request "
+                f"declared; the client cannot dispatch it"
+            )
+            if _RAW_LOG:
+                logger.warning(f"Raw tool-call payload: {raw[:_RAW_MAX]!r}")
+            continue
         try:
             args = json.loads(func.get("arguments") or "{}")
         except Exception:
@@ -1306,12 +1332,48 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected {want_name} {want_args!r}")
 
+    # A call whose name is not among the tools the request declared can never be
+    # dispatched, and the required-parameter check cannot see it: an unknown name
+    # has no schema to compare against. Captured live as one-off names such as
+    # `comment_end`, `tool_invocation` and `skills`.
+    name_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "parameters": {"type": "object", "required": ["file_path"]},
+            },
+        }
+    ]
+    name_cases = [
+        ("undeclared name is flagged", "comment_end", name_tools, True),
+        ("declared name is silent", "write_file", name_tools, False),
+        ("no tools sent stays silent", "comment_end", None, False),
+    ]
+    for label, call_name, tools_arg, want_warning in name_cases:
+        captured: List[str] = []
+        original_warning = logger.warning
+        logger.warning = lambda message, *a, **k: captured.append(str(message))
+        try:
+            _log_tool_call_shapes(
+                [{"function": {"name": call_name, "arguments": "{}"}}], "raw", tools_arg
+            )
+        finally:
+            logger.warning = original_warning
+        got_warning = any("cannot dispatch" in message for message in captured)
+        ok = got_warning == want_warning
+        print(f"{'ok  ' if ok else 'FAIL'} {label}")
+        if not ok:
+            failures += 1
+            print(f"     expected warning={want_warning}, captured {captured!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
         + len(remainder_cases)
         + len(repair_cases)
         + len(control_cases)
+        + len(name_cases)
         + 1
     )
     print(f"{total - failures}/{total} self-test cases passed")

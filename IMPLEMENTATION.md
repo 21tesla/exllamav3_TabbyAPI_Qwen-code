@@ -216,6 +216,26 @@ With `TABBY_PROXY_RAW_LOG=1` the occurrence above is distinguishable: whether `f
 before `arguments` (model hoisted the parameter) or not at all (model omitted it). That is the
 question the name-only logging could not answer.
 
+**Names the request never declared.** The same check now also compares each extracted call's *name*
+against the names the request declared:
+
+```
+[WARNING] Tool call 'comment_end' is not one of the 14 tools this request declared; the client cannot dispatch it
+```
+
+This is the one failure shape the parameter check structurally cannot see, because an unknown name
+has no schema to compare its arguments against. The model has been observed inventing one-off names
+— `comment_end`, `tool_invocation`, `skills`, `r`, `name`, six instances across all TabbyAPI
+sessions, mostly with empty arguments. Ruled out as a real token: the client-bundle hits are a syntax
+highlighting grammar (`invalid_comment_end`), and the name is absent from the served
+`tokenizer.json` `added_tokens` and from `chat_template.jinja`, so it is the model's own invention
+rather than a template artefact.
+
+The warning is what makes such a payload decidable: it fires on the name before the argument check is
+attempted, and with `TABBY_PROXY_RAW_LOG=1` it also dumps the raw payload — which is the only way to
+answer whether the invented call carried meaningful arguments or was empty. As with the parameter
+check, it is silent when the request declared no tools, so the passthrough path stays quiet.
+
 ### 2.9 Raw control characters inside a JSON string
 
 The extractor failed on a real turn on 2026-09-25 (session `0faa6605`) whose call looked well-formed
@@ -734,6 +754,7 @@ Each of these actually happened, and each is now handled or documented.
 | `write_file` rejected with `invalid_tool_params: required property 'file_path'` | the model emitted the call with only `content` | proxy now warns with the missing key, and can dump the raw payload (§2.8) |
 | session halts with `malformed tool call` over a DSML tail | a raw control character (literal newline) inside the JSON string made the call unparseable, so the block reached the client as text | decoders accept control characters in strings (`strict=False`, §2.9) |
 | session halts with `malformed tool call`, `Expecting ',' delimiter` | the model closed a JSON string early on an unescaped `"`; the quote is indistinguishable from a real delimiter, so repair would be guesswork | injected tool instructions now spell out `\"` / `\n` escaping (§2.10) |
+| a call vanishes with no error at all | the model emitted a name the request never declared (`comment_end` and friends) | proxy now warns that the client cannot dispatch it, and can dump the raw payload (§2.8) |
 
 ---
 
