@@ -165,3 +165,4 @@ qwen --prompt "Solve 5 + 5"     # end-to-end through the proxy
 | `install.sh` | the executable form of both documents |
 | `LD-INSTALL.md` | **this machine only** — absolute paths, the GPU, and a log of the 2026-09-25 repairs. Deliberately git-ignored |
 | `tabby-proxy@.service`, `tabby_proxy.py` | the two artifacts that actually ship |
+| `tabby_watch.py` | optional observer: reports only failures on the TabbyAPI path (§12) |

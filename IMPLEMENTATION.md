@@ -787,3 +787,48 @@ loses them: `~/.local/bin/tabby-reboot-verify.sh`, its
 `~/software/tools/{load,unload}-deepseek.bash`. The reboot-verify script matches `:8081` rather
 than a literal address, because the proxy's bind is `TABBY_PROXY_HOST` and a pinned `127.0.0.1`
 silently stops matching once the proxy is on `0.0.0.0`.
+
+---
+
+## 12. Watching the connection
+
+`tabby_watch.py` is an optional observer, not part of the serving path: it reports failures so a
+fault is noticed while it is happening rather than reconstructed afterwards. Run it directly, or
+under a harness that turns each stdout line into a notification:
+
+```bash
+~/software/exllamav3-anemone/venv/bin/python tabby_watch.py
+```
+
+It reads two streams, both scoped to the local TabbyAPI path:
+
+1. **Transcripts**, across every project under `~/.qwen/projects/*/chats`. The backend is
+   identified from each transcript's own `"model"` field, not from its directory — several projects
+   hold both a TabbyAPI and an Ollama session, so a directory-scoped filter is the wrong
+   instrument. `DeepSeek-V4-Flash-0731-exl3-2.32bpw` is TabbyAPI; `deepseek-v4.1-flash:cloud` is
+   Ollama and is skipped entirely.
+2. **The proxy journal**, `journalctl --user -u <unit> -f`, filtered to non-2xx responses and error
+   lines.
+
+**What it reports, and what it deliberately does not.** A user-cancelled tool result is a decision,
+not a defect, so it is skipped. A detail string has its whitespace collapsed before printing,
+because each printed line is a separate notification and a shell error otherwise carries its whole
+multi-line output into a dozen of them.
+
+**One call, one report.** An undeclared tool name and the failure of that same call are two
+transcript records for one call id, so the first is held for `MERGE_WINDOW_S` and the second merges
+into a single line naming both the invented name and the underlying error. A finding whose partner
+never arrives is emitted anyway once the window closes, marked `unpaired`, so holding can never
+swallow a report.
+
+**The pairing key is `functionResponse.id`, not `toolCallResult.callId`.** Measured across every
+transcript on this machine: 51875 populated `functionCall.id` values and **zero** populated
+`toolCallResult.callId` values. That field is declared in the schema but never written, so pairing
+on it would silently never match.
+
+**It carries no machine-specific name.** The proxy unit is derived the way `install.sh` derives it —
+`tabby-proxy@$(systemd-escape --path "$HOME").service` — with `TABBY_PROXY_UNIT` as an override, and
+`TABBY_WATCH_MODEL` / `TABBY_WATCH_PROJECTS` exist for the same reason. The heartbeat exists because
+a harness kills a command that stops printing, so a quiet session must still emit a pulse; an
+ordinary heartbeat is liveness, not a report of new trouble, and the per-tag counters it prints are
+cumulative.
