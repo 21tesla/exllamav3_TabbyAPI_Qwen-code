@@ -1094,8 +1094,9 @@ prints `SyntaxWarning: invalid escape sequence` first — **767 lines** from thi
 third of the proxy's whole journal since restart. Cosmetic, but it buries the real `[WARNING]`s.
 Fixed with `_literal_eval_quiet` (wraps the call in `warnings.catch_warnings()`; the exception still
 propagates, the value is unchanged), applied at both fallback sites. The fix is committed and
-self-tested (104/104), but **not yet deployed** — the session was mid-turn, and a restart during a
-live request would cut the probe; it takes effect at the next natural boundary.
+self-tested (104/104) and **deployed at `00:12:21`** (PID 2408887 → 2427805), bundled with the
+fabrication detector below. The restart was taken during a *safe* window — the client was running its
+own pytest locally, so no POST was in flight and the probe was not cut.
 
 **Self-echo: the model wrote tool *results* into its own completion.** The same `00:07:45` payload
 carries **8 `[Tool Output call_…]` blocks and 5 `</tool_command>` closers** — a result-shaped form the
@@ -1120,4 +1121,19 @@ tool *names* in the ndlite probe (9 in 150 calls), now appearing as invented *ta
 seen earlier in the (post-compaction) context is not settled by the bytes available — the ids do not
 match, which rules out a faithful echo of real records, but the compaction that fired at ~205k could
 have removed the originals from this transcript. Recorded as open.
+
+**The fabrication detector, deployed.** Because a fabricated result is invisible to the schema checks
+(there is no call to check), it needed its own instrument: `_log_result_fabrication`, called wherever
+calls are extracted, warns when a completion carries `[Tool Output call_…]` text or a
+`</tool_command>` closer. It deliberately does **not** compare the embedded ids against the batch —
+the extractor mints a fresh `call_<uuid>` id for every call, so no comparison against them could ever
+discriminate; the marker's *presence* is the signal. Two self-test cases (the live shape and a clean
+control); self-test **106/106**. Committed `dae79d2`, deployed with the `_literal_eval_quiet` fix at
+`00:12:21` (PID 2408887 → 2427805).
+
+**One more key-incomplete `edit` at `00:12:15`.** The batch immediately before the restart — 24 calls
+— carried an `edit` missing **both** `new_string` and `old_string`, keys `['content', 'file_pa…']`.
+Same subcase as before (a complete object, short of required keys), and the second instance of it in
+two batches. It is now the most *frequent* argument-layer fault on this probe, always caught by §18
+and always paired with a sibling that works.
 
