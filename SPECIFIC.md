@@ -977,3 +977,59 @@ executor is the only component that can know whether `project_io_foundation.py` 
 instrumentation consequence is that the monitor's `TOOL_ERROR` stream, not the proxy journal, is
 where this class is counted — the two instruments are separate by design (§19).
 
+**Addendum — a malformed-argument call the *proxy* loses, and the stall it caused (03:54:07Z,
+turn 73).** This is the same family as the two above — an error in the model's argument *content* —
+but it is the first of them to defeat the proxy, so it is a sub-kind of its own: **a well-formed
+call envelope carrying invalid JSON inside it.**
+
+The turn's completion carried a complete `edit` call:
+
+```
+… ───────────────────────────────────────\n
+<tool_call>\n
+{"name": "edit", "arguments": {"file_path": "…/state/foundation.py", "old_string": "…", "new_string": "…"}}\n
+</｜DSML｜>
+```
+
+The envelope was sound — an ASCII `<tool_call>` opener and a DSML `</｜DSML｜>` closer, a shape the
+reader already handles. What it could not read is the JSON: the `new_string` is Python source whose
+comment contains a pair of **unescaped double quotes**:
+
+```
+# Gly ``HA3 HA2`` row is "stated-but-unbound" (§132 keeps the pair's file spelling …
+```
+
+In a JSON string those `"` must be `\"`. The literal quotes close the string early, so
+`json.loads(strict=False)` fails with `Expecting ',' delimiter` and the whole object is discarded.
+Replayed in code from the true bytes (`ast.literal_eval` of the journal's `repr`, 2 421 chars — the
+`repr` inflates it to 2 473, which is why the byte count must be recovered, not estimated):
+`extract_tool_calls` → **None**, `parse_dsml_tool_calls` → **[]**, `raw_decode` → **FAILED**. There
+is no salvage, because the failure is *inside* the object, not at its edge: the `repair_truncated_json`
+path only bounds an object whose closer is missing, and this one's problem is a terminator that is
+present and wrong.
+
+**What happened to the turn is the part worth recording.** The client did **not** raise
+`InvalidStreamError`. Its predicate (§16) fires on a malformed *tool call*; a completion with no
+call is prose, so the turn ended as text — the transcript's last record is that assistant turn with
+two text parts and no call, and no further turn was recorded in the next two minutes. The
+distinction matters: the class that *aborts* the session is the `finish_reason: "tool_calls"` with
+zero calls; **a call that is silently dropped is quieter and, for a mission-critical run, worse** —
+the work simply does not happen, and nothing errors.
+
+**No proxy change, and the reason is a judgement, not a limitation.** The proxy *could* be taught to
+re-scan a rejected object for its argument *value* by a less strict reading (the `new_string` text is
+recoverable to a human by splitting on the bare `"…"` pattern). It should not: the client's `edit`
+would then apply a value the model did not validly emit, and manufacturing an argument the model
+failed to encode is exactly the intervention a schema guard must not make. The correct handling is
+the one already in place — report the loss where a human can see it.
+
+The visibility here came from the older, blunter instrument, and it is worth being precise about
+which: the `marked` test (`"DSML" in raw or "<tool_call" in raw or "\uff5c" in raw`) plus the
+armed `TABBY_PROXY_RAW_LOG`, which dumps the completion *and* the reasoning. It is **not** §19's
+`_CALL_TAG_OPENER_RE` — that detector warns only when a call-shaped tag has *no* `_TAG_RE` match,
+and this tag matched fine (`<tool_call>` is 11 characters). So this event is the return on the
+raw-dump decision instead: the dump fires on the marker, the marker was the ASCII `<tool_call>`, and
+the bytes it captured are the only reason the failure could be replayed and named. Both instruments
+earned their place — but attributing the catch to the wrong one would put a false confidence in
+§19's net for a case it does not reach.
+
