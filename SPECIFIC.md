@@ -941,6 +941,28 @@ two-call `edit` pair and a one-call recovery `read_file` — so what is untested
 behaviour in this band, which is exactly the regime §14's loss occurred in. The regime has not
 been shown absent above 195k; it has been shown absent for small turns.
 
+**The caveat then closed itself, and the ledger says so.** The probe went on to run two mid-size
+batches at the top of the context — 5 calls (`read_file`×3, `grep_search`×2) at 198 395 tokens and
+4 calls (`edit`×2, `read_file`×2) at **203 194 tokens** — and both parsed cleanly with no warnings.
+So the wide-batch regime is now exercised past 195k, and it held. 203 194 is also past the 200k
+nominal context of an ordinary session, so the threshold story is spent: whatever governs §14's
+loss, it is not "input length crosses N."
+
+**The stronger check is the call/result ledger, not the parse count.** A parse line reports what
+the *proxy* recovered; it cannot report a call that reached the client and then vanished. Pairing
+every `functionCall` id against every `functionResponse` id over the whole session — a check that
+needs no proxy cooperation and would catch the silent-drop class §18 described — balances exactly:
+
+```
+calls seen: 260    results seen: 260
+calls with NO result: []    results with NO call: []
+```
+
+That is the §19 principle applied whole-session: not "no warning fired" but "every call the model
+emitted has a result, and every result has a call." A silent loss of the §18 kind would break this
+invariant immediately — a balanced ledger is positive evidence of completeness, which a clean
+failure log never is.
+
 **`invalid_tool_params` is a family, and the layer decides the sub-kind.** These two events and
 §18's eight split by which component can see the fault:
 
