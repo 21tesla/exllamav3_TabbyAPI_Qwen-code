@@ -1191,3 +1191,22 @@ this is emission-side degradation bound to the session's context state, not a pr
 talked out of. The parser again behaved correctly (nothing parseable, guard rewrote to `stop`, turn
 survived as prose); the remedy is to rescue the session state, not to re-send.
 
+**Compaction clears it briefly, then it returns — the collapse is load-dependent.** `/compact` was
+run at `00:49:11` (a `slash_command` record, invocation → result). The compaction turn itself tripped
+the marker heuristic but carried **no** repetition — a 20 275-char `<analysis>` summary of this very
+project, whose prose necessarily contains `DSML`/`<tool_call>` substrings; three `unparsed` warnings,
+zero calls, benign (a false positive of `marked`, not a fault). After the compact, the next resumed
+turn emitted **real calls again** — eight in a row (`grep_search`, `read_file` ×5, …) between `00:52`
+and `00:52:44`, each parsed from content, **no collapse** — so the small context restored argument
+emission. Then at `00:52:58`, as context re-accumulated, a **third** collapse: completion 2 820 chars
+with **266** wrong-glyph wrapper openers (U+FF5C, as above; denser than either prior instance —
+nearly all delimiters), reasoning again carrying `<shift_list>`. Sequence of widths: **98 → 178 →
+266**, each after the context grew
+back. That is the shape of a load-dependent emission failure, not a content trigger: the same model,
+same task, emits clean calls at small context and collapses at large. Compaction is therefore a
+*temporary* remedy, and the width trend says the threshold is being crossed sooner each cycle.
+
+Running tally of `[WARNING]` on the deployed build: 6 for the two pre-compact collapses, 3 for the
+benign compaction-summary false positive, 3 for the third collapse — 12 total, fabrication detector
+0, `SyntaxWarning` 0 throughout.
+
