@@ -1177,3 +1177,17 @@ client renders an end-of-turn instead of a 10 KB wall. The prose between the del
 the model wrote, so a naive collapse would discard content; the delimiters alone are safe to drop but
 are also the only signal that distinguishes this collapse from ordinary prose. Recorded as open.
 
+**The collapse reproduces on resume, and widens.** A cross-session nudge ("continue the item (6)
+work") was delivered at `00:47:20`; the session woke (GPU 97%) and the very next completion collapsed
+the same way, but **wider** — **178** openers against the 98 above, the same wrong-glyph wrapper
+token (the U+FF5C form; ordinals identical to the table above, the bars are *not* ASCII `|`).
+The loop content is now legible and diagnostic: the model is repeatedly *intending* the call it needs
+(`"Let me read build_resonance_table (foundation.py) and the window's _update_resonance_table."` ×22,
+plus ×8 and ×4 variants), but the completion degenerates exactly where the call **body** belongs — it
+emits the wrapper opener, restates the intent, and never produces arguments. So the same turn that
+would carry the call cannot finish it, and each nudge reproduces the fault rather than clearing it.
+That the run *widens* (98 → 178) rather than clearing is what makes a re-prompt the wrong instrument:
+this is emission-side degradation bound to the session's context state, not a prompt the model can be
+talked out of. The parser again behaved correctly (nothing parseable, guard rewrote to `stop`, turn
+survived as prose); the remedy is to rescue the session state, not to re-send.
+
