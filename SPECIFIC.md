@@ -1097,3 +1097,27 @@ propagates, the value is unchanged), applied at both fallback sites. The fix is 
 self-tested (104/104), but **not yet deployed** — the session was mid-turn, and a restart during a
 live request would cut the probe; it takes effect at the next natural boundary.
 
+**Self-echo: the model wrote tool *results* into its own completion.** The same `00:07:45` payload
+carries **8 `[Tool Output call_…]` blocks and 5 `</tool_command>` closers** — a result-shaped form the
+client *never* produces. The proxy and client encode results as a `functionResponse` record and
+re-inject them as a **user** turn; the string `[Tool Output` and the tag `tool_command` appear
+nowhere in the transcript format. None of the eight ids the blocks name (`56dc8eee`, `1804655a`,
+`2588e646`, `8e5c61f8`, `d798f85d`, `5e788305`, `73d3c1a4`, `80e99a6f`) exists as a real call id in
+the transcript. The model was therefore **writing the *output* half of the exchange itself** — and
+reasoning from it: the prose beside the blocks reads "the affected tests passed" and "FOUND", a
+verified-sounding conclusion built on text it authored. The proxy was not fooled — it parsed 25 calls
+from the dumped prefix and **none** from the fabricated blocks, because they carry no `<tool_call>`
+envelope. This is a distinct family: not a mangled call (`§14`), not a dropped call (the malformed-`"`case
+above), not a key-incomplete call (§18), but a **fabricated result** — the most dangerous shape for a
+mission-critical run, because a real call the model makes *and* a fake result it narrates are
+indistinguishable to the model, and it acts on both.
+
+The `</tool_command>` closer is the tell: a call envelope in this stream closes with `</｜DSML｜>`,
+so a completion that closes with `</tool_command>` is one where the model has drifted off the
+protocol it was trained on and is inventing wrapper markup — the same drift family as the invented
+tool *names* in the ndlite probe (9 in 150 calls), now appearing as invented *tags* and invented
+*results* instead of invented names. Whether the blocks are pure invention or a replay of results
+seen earlier in the (post-compaction) context is not settled by the bytes available — the ids do not
+match, which rules out a faithful echo of real records, but the compaction that fired at ~205k could
+have removed the originals from this transcript. Recorded as open.
+
