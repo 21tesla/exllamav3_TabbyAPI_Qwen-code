@@ -826,3 +826,51 @@ and the client's `call_8baf2ff1 grep_search {}` at `03:16:50.959Z` (UTC), whose 
 journal is **0**. The empty-argument class as recorded here is pre-deploy; whether it is closed
 outright is what the probe's next turns test.
 
+## 19. Watching a parser that fails silently (2026-09-27 00:35)
+
+§18's loss went unnoticed not because it was hard to see but because *nothing was watching for it*.
+The proxy's raw dump fires only when parsing **fails**; a dialect that parses leaves no record that
+it was ever seen. So the instrument records a defect only when the defect wins — the same asymmetry
+as §16's substring filter, and the reason a call can vanish while every log line reads clean. Three
+gaps were closed, all in the direction of making the invisible visible.
+
+**Native calls were never shape-checked.** `_log_tool_call_shapes` ran on calls scraped from the
+text fields and on nothing else. A call the *upstream* parsed — TabbyAPI's own `deepseek_v4` DSML
+reader, delivered over `delta.tool_calls` — was emitted straight to the client, unchecked. That is
+exactly how the three empty `glob` calls reached the client with no warning (§18): their `{}`
+arguments were never compared to the schema because nothing compared them. Both native paths now
+call `_log_tool_call_shapes` — the streaming one just before it settles the finish reason, the
+non-streaming one beside the empty-call guard. An unusable native call is now as visible as an
+unusable scraped one.
+
+**A dialect that parses left no trace.** The `skill`/`call_tool` shape carries its whole argument
+object as an attribute, and an INFO line now records each time one is read:
+
+```
+Read an argument object carried on the '_skill' tag as args= (2 key(s): ['path', 'pattern'])
+```
+
+Without it, the only evidence the shape ever arrived is that a call came out right — and since a
+*missing* call just makes the count smaller, the shape could regress to unread with no error at all.
+This is the line that turns "five calls, no complaints" into "five calls, three of them read from
+the attribute dialect."
+
+**An unreadable tag was unreadable without a word.** A call-shaped opener that `_TAG_RE` cannot
+match — the §18 case, a body longer than `_TAG_BODY_MAX` — now warns:
+
+```
+A call-shaped tag at offset 0 has no match within 1000 chars (len to next '>' is 1255);
+its call is not read. Marker: '<|DSML|skill name="grep_search" args="{\'pattern\': \'xxx…'
+```
+
+The detector is deliberately strict: it requires `<`, optional DSML framing, an optional `_`, then a
+call keyword (`tool_call`, `call_tool`, `skill`, `invoke`, `calls`). A closing tag, the `Output`-echo
+envelope, a `name=`-as-tag-name call and a word in prose all fail it — so it marks precisely the
+openers that *should* have parsed, and a warning from it means a call was lost, not that the model
+wrote something odd.
+
+All three are covered by self-test cases (97 total), because a guard no one can see fire is no
+better than no guard. The principle this section records: **on a mission-critical path, instrument
+the success as well as the failure** — the failure log is empty in both the good case and the
+invisible-loss case, and only the positive trace tells them apart.
+

@@ -71,6 +71,15 @@ _DSML_ESCAPED_UNDERSCORE = re.compile(r"(?i)\\u2581")
 # is kept, not removed: it is what stops prose from being scanned as one long tag.
 _TAG_BODY_MAX = 1000
 _TAG_RE = re.compile(r"<[^<>]{0,%d}>" % _TAG_BODY_MAX)
+# A call-shaped *opener* in the raw text: `<`, then optional DSML framing (the bar
+# and `DSML`), an optional `_`, then a word that starts one of this checkpoint's call
+# dialects (`tool_call`, `call_tool`, `skill`, `invoke`, `calls`). Deliberately strict:
+# a closer (`</…>`), the `Output`-echo envelope, a `name=`-as-tag-name call and a word
+# in prose all fail it, so it marks precisely the openers that ought to have parsed.
+_CALL_TAG_OPENER_RE = re.compile(
+    r"<(?:\s*[\u007c\uff5c]\s*DSML\s*[\u007c\uff5c]\s*)?_?"
+    r"(?:tool_call|call_tool|skill|invoke|calls|function_call)\w*"
+)
 # An attribute value, in any of the three spellings this checkpoint uses:
 #   key="value"   key='value'   key={...}
 # The quoted arms are mutually exclusive on purpose. The value class must admit one
@@ -418,10 +427,19 @@ def parse_dsml_tool_calls(
             frame = {"kind": "call", "name": name, "args": {}}
             # The `call_tool` dialect carries the whole argument object as an
             # attribute rather than as a child element; fold it in so the call is
-            # not emitted with empty arguments.
+            # not emitted with empty arguments. The trace is positive on purpose: the
+            # raw dump exists only when parsing *fails*, so a dialect that parses
+            # leaves no record that it was ever seen. Without this line the only way
+            # to know the shape reached the proxy is that a call came out right --
+            # and a smaller call count reads as the model having written fewer.
             for args_key in _CALL_ARGS_KEYS:
                 if args_key in attrs:
                     frame["args"].update(_parse_attr_arguments(attrs[args_key]))
+                    logger.info(
+                        "Read an argument object carried on the %r tag as %s= "
+                        "(%d key(s): %s)",
+                        keyword, args_key, len(frame["args"]), sorted(frame["args"]),
+                    )
                     break
             # The `call` dialect carries each argument as its own attribute instead
             # (`<|DSML|call name="read_file" file_path="..." offset="60"/>`), so once
@@ -465,6 +483,26 @@ def parse_dsml_tool_calls(
         stack[-1]["buf"].append(content[cursor:])
     while stack:
         _close_dsml_frame(stack, "", calls)
+
+    # A call-shaped opener the scanner could not see is the §18 failure mode: a tag
+    # whose body exceeds `_TAG_BODY_MAX`, or whose `>` never arrives, matches
+    # `_TAG_RE` not at all -- so its call vanishes while the count merely comes out
+    # lower, and a lower count reads as the model having written fewer calls. Warn
+    # when the text carries such an opener, so the class can never be silent again.
+    # Restricted to openers (`<` plus whitespace/DSML-bar then `tool_call`/`skill`/
+    # `invoke`), which is narrow enough not to fire on a closing tag or on prose that
+    # merely names one.
+    if _CALL_TAG_OPENER_RE.search(content):
+        for m in _CALL_TAG_OPENER_RE.finditer(content):
+            if _TAG_RE.match(content, m.start()) is None:
+                logger.warning(
+                    "A call-shaped tag at offset %d has no match within %d chars "
+                    "(len to next '>' is %s); its call is not read. Marker: %r",
+                    m.start(), _TAG_BODY_MAX,
+                    (content.find(">", m.start()) - m.start()) if ">" in content[m.start():] else "none",
+                    content[m.start():m.start() + 80],
+                )
+                break
 
     return calls, first
 
@@ -1622,6 +1660,13 @@ async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient,
     tool_calls = _merge_native_tool_calls(message, native_tool_calls)
     if tool_calls and finish_reason == "tool_calls":
         choice["finish_reason"] = "tool_calls"
+    # A native call is emitted straight from the upstream's parse and so never went
+    # through the shape check that text-extracted calls get -- which is why three
+    # `glob` calls with `{}` arguments reached the client with no warning at all
+    # (SPECIFIC.md 18). Check it here too: an unusable native call must be as visible
+    # as an unusable scraped one.
+    if native_tool_calls and tool_calls:
+        _log_tool_call_shapes(tool_calls, content_text or reasoning_text or "", tools)
 
     for field, parsed, raw, sent in (
         ("reasoning_content", final_reasoning, reasoning_text, sent_reasoning),
@@ -1784,6 +1829,11 @@ async def chat_completions_proxy(request: Request):
             # `msg`, so the guard sees it and holds.
             native = bool(msg.get("tool_calls"))
             process_message_tools_and_thinking(msg, choice, tools, native=native)
+            # A native call skips the shape check the text path runs, so check it
+            # here as well: an empty-argument native call reaches the client exactly
+            # as silently as it did on the streaming path (SPECIFIC.md 18).
+            if native and msg.get("tool_calls"):
+                _log_tool_call_shapes(msg["tool_calls"], msg.get("content") or "", tools)
             # Same guard as the streaming path: a finish reason of `tool_calls`
             # with an empty list is read as a malformed call and ends the turn.
             if choice.get("finish_reason") == "tool_calls" and not msg.get("tool_calls"):
@@ -2668,6 +2718,57 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
+    # The monitoring added for mission-critical use: three ways a call can go missing
+    # without an error, each now logged. Tested because the §18 loss was itself
+    # invisible -- a guard no one can see fire is no better than none.
+    _monitor_tools = [
+        {"type": "function", "function": {"name": "glob", "parameters": {
+            "type": "object", "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"]}}}
+    ]
+    _orig_info, _orig_warning = logger.info, logger.warning
+
+    _attr_text = (f"<{fw}DSML{fw}skill name=\"grep_search\" "
+                  f"args=\"{{'pattern': 'x', 'path': '/tmp/a.py'}}\"/>")
+    captured: List[str] = []
+    logger.info = lambda message, *a, **k: captured.append(str(message))
+    try:
+        extract_tool_calls(_attr_text)
+    finally:
+        logger.info = _orig_info
+    ok = any("Read an argument object" in m for m in captured)
+    print(f"{'ok  ' if ok else 'FAIL'} monitor the attribute dialect leaves a positive trace")
+    if not ok:
+        failures += 1
+        print(f"     captured {captured!r}")
+
+    _over = (f"<{fw}DSML{fw}skill name=\"grep_search\" "
+             f"args=\"{{'pattern': '{'x' * (_TAG_BODY_MAX + 200)}'}}\"/>")
+    captured = []
+    logger.warning = lambda message, *a, **k: captured.append(str(message))
+    try:
+        extract_tool_calls(_over)
+    finally:
+        logger.warning = _orig_warning
+    ok = any("no match within" in m for m in captured)
+    print(f"{'ok  ' if ok else 'FAIL'} monitor a tag beyond the body cap is flagged")
+    if not ok:
+        failures += 1
+        print(f"     captured {captured!r}")
+
+    captured = []
+    logger.warning = lambda message, *a, **k: captured.append(str(message))
+    try:
+        _log_tool_call_shapes(
+            [{"function": {"name": "glob", "arguments": "{}"}}], "", _monitor_tools)
+    finally:
+        logger.warning = _orig_warning
+    ok = any("missing required parameter" in m for m in captured)
+    print(f"{'ok  ' if ok else 'FAIL'} monitor a native empty-argument call is warned")
+    if not ok:
+        failures += 1
+        print(f"     captured {captured!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -2690,6 +2791,7 @@ def _selftest() -> int:
         + len(round5_cases)
         + len(round6_cases)
         + len(round7_cases)
+        + 3
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
