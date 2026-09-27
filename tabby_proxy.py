@@ -7,6 +7,7 @@ import uuid
 import asyncio
 import logging
 import sys
+import warnings
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import httpx
 import uvicorn
@@ -364,6 +365,22 @@ def _close_dsml_frame(stack: List[dict], keyword: str, calls: List[dict]) -> Non
         calls.append({"name": frame["name"], "arguments": frame["args"]})
 
 
+def _literal_eval_quiet(text: str) -> Any:
+    """`ast.literal_eval` without the `SyntaxWarning` flood on regex arguments.
+
+    A `grep_search` pattern such as `_width\\s*=|\\bHEIGHT` is invalid JSON (`\\s` is
+    not a JSON escape) and also invalid Python, but Python only *warns* where JSON
+    *rejects*. Every such pattern therefore compiles through the Python-literal
+    fallback and prints `SyntaxWarning: invalid escape sequence` -- 767 of them in
+    one 89-call batch, live 2026-09-27, roughly a third of that proxy's journal.
+    Suppress the warning here; the exception still propagates, so each caller keeps
+    its own failure handling and the recovered value is unchanged.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        return ast.literal_eval(text)
+
+
 def _parse_attr_arguments(value: str) -> Dict[str, Any]:
     """Read an argument object carried as an attribute value.
 
@@ -391,7 +408,7 @@ def _parse_attr_arguments(value: str) -> Dict[str, Any]:
     # is safe here: it evaluates literals only, never a call. It is a fallback, so
     # a value that is already valid JSON keeps the reading it has always had.
     try:
-        parsed = ast.literal_eval(value)
+        parsed = _literal_eval_quiet(value)
     except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
@@ -870,7 +887,7 @@ def repair_truncated_json(text: str) -> Optional[Any]:
     # fallback, so the JSON reading always wins.
     for cut in cuts:
         try:
-            obj = ast.literal_eval(text[:cut])
+            obj = _literal_eval_quiet(text[:cut])
         except Exception:
             continue
         if isinstance(obj, (dict, list)):
@@ -2154,6 +2171,19 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
+    # A regex argument (`_width\s*=|…`) is invalid JSON *and* invalid Python, so it
+    # reaches the literal fallback; `ast.literal_eval` still raises, but not before
+    # emitting a `SyntaxWarning` -- 767 of them in one 89-call batch (2026-09-27).
+    # The helper must emit none while still returning the value.
+    with warnings.catch_warnings(record=True) as _caught:
+        warnings.simplefilter("always")
+        _got = _literal_eval_quiet("['_width\\s*=|_HEIGHT']")
+    _quiet_ok = len(_caught) == 0 and _got == ["_width\\s*=|_HEIGHT"]
+    print(f"{'ok  ' if _quiet_ok else 'FAIL'} literal-fallback emits no SyntaxWarning: "
+          f"warnings={len(_caught)}, value={_got!r}")
+    if not _quiet_ok:
+        failures += 1
+
     # A string value carrying raw control characters (a literal newline in a
     # multi-line `content`) is invalid strict JSON, but is what the checkpoint
     # actually emits. Captured live 2026-09-25: an extraction returned nothing
@@ -2903,6 +2933,7 @@ def _selftest() -> int:
         + len(repair_cases)
         + len(quote_repair_cases)
         + 2
+        + 1
         + len(control_cases)
         + len(name_cases)
         + len(width_cases)

@@ -1074,3 +1074,26 @@ step: it had a working edit to compare against. One batch, two argument-layer fa
 difference between them is the difference between a call the proxy can reach and one only the schema
 check can.
 
+**The 89-call batch and the widest-yet width question.** At `00:07:45` (local) / `04:07:45Z` the
+model emitted **89 tool calls in one completion** — nearly double §14's 48-call clean batch and the
+widest seen on any probe. It carried exactly **one** schema fault: a `read_file` with keys
+`['limit', 'offset', 'output']` and no `file_path` — a member of the same key-incomplete subcase as
+the `edit` above, and (like it) valid JSON, so the §18 check caught it rather than the parser. Width
+is therefore still not the trigger: 89 calls, one argument fault, no glyph loss. The batch's tail
+repeats `read_file`/`grep_search` on the same `main_window.py` with drifting offsets — the
+repetition family §2.11 describes — but every repeated call was well-formed enough to parse, and the
+proxy read all 89. **Caveat on the evidence:** the raw dump is capped at `_RAW_MAX` (20 000 chars,
+`TABBY_PROXY_RAW_LOG_CHARS`), so it holds only the completion's first 20 000 characters (25 of the 89
+calls); the count of 89 comes from the proxy's own parse, not from a full byte-level replay.
+
+**767 `SyntaxWarning`s in one batch — the Python-literal fallback's noise floor.** A `grep_search`
+pattern such as `_width\s*=|…` is invalid JSON (`\s` is not a JSON escape) and also invalid Python,
+but the two disagree on how to fail: JSON *rejects* it, Python only *warns*. So every `\`-bearing
+pattern reaches `repair_truncated_json`'s `ast.literal_eval` fallback, which raises either way but
+prints `SyntaxWarning: invalid escape sequence` first — **767 lines** from this single batch, about a
+third of the proxy's whole journal since restart. Cosmetic, but it buries the real `[WARNING]`s.
+Fixed with `_literal_eval_quiet` (wraps the call in `warnings.catch_warnings()`; the exception still
+propagates, the value is unchanged), applied at both fallback sites. The fix is committed and
+self-tested (104/104), but **not yet deployed** — the session was mid-turn, and a restart during a
+live request would cut the probe; it takes effect at the next natural boundary.
+
