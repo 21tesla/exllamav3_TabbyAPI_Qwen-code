@@ -355,6 +355,19 @@ def parse_dsml_tool_calls(
                 if args_key in attrs:
                     frame["args"].update(_parse_attr_arguments(attrs[args_key]))
                     break
+            # The `call` dialect carries each argument as its own attribute instead
+            # (`<|DSML|call name="read_file" file_path="..." offset="60"/>`), so once
+            # the name and the container keys above are accounted for, what is left
+            # on the tag *is* the argument list. Without this the call went out with
+            # `{}` and the client refused it as `invalid_tool_params`; captured live
+            # 2026-09-26 as a `read_file` missing `file_path`. `_CALL_ARGS_KEYS` is
+            # excluded on purpose: if `args` were both a container and a plain
+            # argument, the container already read it, and adding the raw string
+            # would clobber the parsed object. Attribute values are always strings,
+            # which is exactly what a tool argument may be, so they are passed as-is.
+            for key, value in attrs.items():
+                if key not in _CALL_META_KEYS and key not in _CALL_ARGS_KEYS:
+                    frame["args"].setdefault(key, value)
             stack.append(frame)
             if first is None:
                 first = match.start()
@@ -2345,6 +2358,36 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
+    # The `call` dialect puts each argument on the tag as its own attribute rather
+    # than inside one object: `<|DSML|call name="read_file" file_path="..." offset="60"/>`.
+    # `|DSML|` fuses into the tag name, so the keyword is `call`, and the whole
+    # argument list is the leftover attributes. Before this the call went out `{}`
+    # and the client answered `invalid_tool_params` -- captured live 2026-09-26 as a
+    # `read_file` missing `file_path`. Values stay strings, since that is what an
+    # attribute is. The `args` leg is the guard on the other side: there `args` is a
+    # container, already read, and the raw string must not clobber the parsed object.
+    round5_cases = [
+        ("per-argument attributes are read",
+         "<tool_call>\n"
+         f'<{fw}DSML{fw}call name="read_file" file_path="/tmp/x.py" offset="8390" limit="60"/>\n'
+         "</tool_call>",
+         [("read_file", {"file_path": "/tmp/x.py", "offset": "8390", "limit": "60"})]),
+        ("a lone self-closing call tag is read",
+         f'<{fw}DSML{fw}call name="glob" pattern="src/**"/>',
+         [("glob", {"pattern": "src/**"})]),
+        ("a container attribute is not clobbered by its raw string",
+         f'<{fw}DSML{fw}call name="read_file" args={{"/tmp/y"}}>',
+         [("read_file", {})]),
+    ]
+    for label, raw, expected in round5_cases:
+        calls, _cleaned = extract_tool_calls(raw)
+        got = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in (calls or [])]
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} round5 {label}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -2364,6 +2407,7 @@ def _selftest() -> int:
         + len(round3_cases)
         + 1
         + len(guard_cases)
+        + len(round5_cases)
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
