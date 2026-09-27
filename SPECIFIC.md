@@ -1016,12 +1016,29 @@ distinction matters: the class that *aborts* the session is the `finish_reason: 
 zero calls; **a call that is silently dropped is quieter and, for a mission-critical run, worse** —
 the work simply does not happen, and nothing errors.
 
-**No proxy change, and the reason is a judgement, not a limitation.** The proxy *could* be taught to
-re-scan a rejected object for its argument *value* by a less strict reading (the `new_string` text is
-recoverable to a human by splitting on the bare `"…"` pattern). It should not: the client's `edit`
-would then apply a value the model did not validly emit, and manufacturing an argument the model
-failed to encode is exactly the intervention a schema guard must not make. The correct handling is
-the one already in place — report the loss where a human can see it.
+**The proxy was taught to recover it — and the measurement, not the request, is what justified the
+change.** This paragraph first read "no proxy change, and the reason is a judgement, not a
+limitation": re-reading a rejected object would apply a value the model did not validly emit, and
+manufacturing an argument is exactly the intervention a schema guard must not make. That judgement was
+reversed once the decisive measurement was made. Repairing **only the two unescaped quote
+characters** — nothing else, no value invented, no field defaulted — makes the object parse as JSON
+again, and the recovered `edit` carries its three arguments exactly as emitted: `new_string` is
+byte-for-byte what the model wrote (1103 chars, the quoted word `stated-but-unbound` intact), and
+`old_string` is 544. The distinction the earlier judgement missed is between *supplying* what the
+model left out and *un-escaping* what it actually wrote: both `"` characters are present in the
+stream, so escaping them is faithful recovery, not invention.
+
+`repair_unescaped_quotes` (beside `repair_truncated_json`) walks the object and escapes a bare `"`
+only when a non-structural character follows it (whitespace ignored): a genuine string-closer is
+followed by `,`, `}`, `]`, `:` or the end of the value, whereas a quote *inside* a value is followed
+by more content. It is reached from `extract_tool_calls` only after `repair_truncated_json` has
+already failed, over the same fragment search, and it re-serialises a candidate only if the whole
+object then reads as JSON — so a wrong guess fails closed and cannot corrupt a value that already
+parsed. The false-positive controls hold: three valid-JSON fragments (an escaped quote inside a path,
+a lone escaped quote, a bare quote with nothing after it) all return `None`. The self-test grew from
+97 to 103 cases, and replayed against the real 2 421-byte payload the new path now yields
+`[('edit', ['file_path', 'old_string', 'new_string'])]`. Deployed 2026-09-27 (proxy PID 2383941 →
+2408887) so the stalled session could resume.
 
 The visibility here came from the older, blunter instrument, and it is worth being precise about
 which: the `marked` test (`"DSML" in raw or "<tool_call" in raw or "\uff5c" in raw`) plus the

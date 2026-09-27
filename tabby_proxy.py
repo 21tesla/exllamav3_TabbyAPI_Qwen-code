@@ -878,6 +878,62 @@ def repair_truncated_json(text: str) -> Optional[Any]:
     return None
 
 
+def repair_unescaped_quotes(text: str) -> Optional[Any]:
+    """Parse `text` as JSON after escaping bare quotes that sit inside a string value.
+
+    The checkpoint emits a tool argument whose string value carries a literal `"`
+    that is not escaped -- captured live 2026-09-27 (session e5e8c7f9): an `edit`'s
+    `new_string` was Python source whose comment read `row is "stated-but-unbound"`,
+    and the two bare quotes closed the JSON string early, so the call parsed to
+    nothing and the turn stalled with no error. Unlike `repair_truncated_json`, the
+    defect is *inside* the value -- a delimiter that is present and wrong, not a
+    closer that is missing -- so no amount of appending closers reaches it, and
+    `literal_eval` rejects it too (the completion carries the fullwidth `｜`).
+
+    The fix escapes an unescaped quote only when a non-structural character follows
+    it (whitespace ignored): a genuine string-closer is followed by `,`, `}`, `]`,
+    `:` or the end of the value, whereas a quote *inside* a value is followed by
+    more content. The candidate is re-serialised only if the whole object then reads
+    as JSON, so a wrong guess fails closed -- it cannot corrupt a value that already
+    parsed. String content is otherwise preserved verbatim, quotes and backslashes
+    included, because the repair changes escaping, never the text.
+    """
+    if '"' not in text:
+        return None
+    out = []
+    inside = False
+    escaped = False
+    changed = False
+    for pos, ch in enumerate(text):
+        if escaped:
+            escaped = False
+            out.append(ch)
+            continue
+        if ch == "\\":
+            escaped = True
+            out.append(ch)
+            continue
+        if ch == '"':
+            if not inside:
+                inside = True
+            else:
+                rest = text[pos + 1 : pos + 40].lstrip()
+                if not rest or rest[0] in (",", "}", "]", ":"):
+                    inside = False
+                else:
+                    out.append('\\"')
+                    changed = True
+                    continue
+        out.append(ch)
+    if not changed:
+        return None
+    try:
+        obj, _end = json.JSONDecoder(strict=False).raw_decode("".join(out).rstrip())
+        return obj
+    except Exception:
+        return None
+
+
 _RAW_LOG = os.getenv("TABBY_PROXY_RAW_LOG", "").strip().lower() in ("1", "true", "yes", "on")
 _RAW_MAX = int(os.getenv("TABBY_PROXY_RAW_LOG_CHARS", "20000") or "20000")
 
@@ -1226,6 +1282,21 @@ def extract_tool_calls(
                             break
                     if repaired is not None:
                         break
+                if repaired is None:
+                    # A closer that is present but wrong, rather than absent: a
+                    # string value carrying a bare `"` closes early and strands the
+                    # rest of the object. Observed live 2026-09-27 (session
+                    # e5e8c7f9): an `edit` whose `new_string` comment held
+                    # `row is "stated-but-unbound"` recovered no call at all. Same
+                    # fragment search, different repair.
+                    for text in readings:
+                        for limit in _fragment_ends(text, idx):
+                            repaired = repair_unescaped_quotes(text[idx:limit])
+                            if repaired is not None:
+                                used_limit = limit
+                                break
+                        if repaired is not None:
+                            break
                 if repaired is None:
                     idx += 1
                     continue
@@ -2027,6 +2098,62 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
+    # A closer that is present but wrong: a bare `"` inside a string value. The
+    # 2026-09-27 case is pinned verbatim -- the `new_string` comment is the exact
+    # text that dropped the call -- plus the controls that keep the escape from
+    # firing on valid JSON.
+    _bare = "a row is \"unbound\" here"
+    _escaped_object = "<tool_call>\n" + json.dumps(
+        {"name": "edit", "arguments": {"file_path": "/tmp/a.py", "new_string": _bare}}
+    )
+    quote_repair_cases = [
+        ("a bare quote inside a string value is escaped",
+         '{"name": "edit", "arguments": {"file_path": "/tmp/a.py", '
+         '"old_string": "x = 1", "new_string": "# the row is "unbound" here"}}',
+         {"name": "edit", "arguments": {"file_path": "/tmp/a.py", "old_string": "x = 1",
+                                        "new_string": "# the row is \"unbound\" here"}}),
+        ("an escaped quote value is left alone",
+         '{"name": "read_file", "arguments": {"file_path": "/a\\"b.py"}}',
+         None),
+        ("a single escaped quote is left alone",
+         '{"name": "grep_search", "arguments": {"pattern": "\\""}}',
+         None),
+        ("a bare quote with no following content is left alone",
+         '{"name": "read_file", "arguments": {"file_path": "/tmp/a.py"}}',
+         None),
+    ]
+    for name, fragment, expected in quote_repair_cases:
+        got = repair_unescaped_quotes(fragment)
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} quote-repair {name}: {got!r}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
+    # End to end: the completion is read as one `edit` call whose `new_string` keeps
+    # the bare quotes verbatim, and the `json.dumps` control -- whose quotes are
+    # already escaped -- takes the normal path and is unaffected by the new repair.
+    for label, raw, expected in (
+        ("a call whose argument holds bare quotes is read",
+         '<tool_call>\n{"name": "edit", "arguments": {"file_path": "/tmp/a.py", '
+         '"old_string": "x = 1", "new_string": "# the row is "unbound" here"}}\n</｜DSML｜>',
+         [("edit", {"file_path": "/tmp/a.py", "old_string": "x = 1",
+                    "new_string": "# the row is \"unbound\" here"})]),
+        ("an escaped-quote call is read unchanged",
+         _escaped_object,
+         [("edit", {"file_path": "/tmp/a.py", "new_string": _bare})]),
+    ):
+        calls, _cleaned = extract_tool_calls(raw)
+        try:
+            got = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in (calls or [])]
+        except Exception as exc:
+            got = f"unparseable: {exc}"
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} quote-repair {label}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
     # A string value carrying raw control characters (a literal newline in a
     # multi-line `content`) is invalid strict JSON, but is what the checkpoint
     # actually emits. Captured live 2026-09-25: an extraction returned nothing
@@ -2774,6 +2901,8 @@ def _selftest() -> int:
         + len(marker_cases)
         + len(remainder_cases)
         + len(repair_cases)
+        + len(quote_repair_cases)
+        + 2
         + len(control_cases)
         + len(name_cases)
         + len(width_cases)
