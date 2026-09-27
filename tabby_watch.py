@@ -82,7 +82,12 @@ def classify(rec):
 
     if kind == "system":
         event = (rec.get("systemPayload") or {}).get("uiEvent") or {}
-        if event.get("event.name") == "api_error":
+        # The name is namespaced (`qwen-code.api_error`), so matching the bare
+        # `api_error` matched nothing and this branch never fired: 171 api_error
+        # events across the transcripts, not one of them ever reported. Keep the
+        # qualified name -- a substring test here fails silently, which is the one
+        # failure mode this observer must not have.
+        if event.get("event.name") == "qwen-code.api_error":
             return "API_ERROR", (
                 f"{event.get('error_type')} :: "
                 f"{str(event.get('error_message'))[:160]} "

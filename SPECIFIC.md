@@ -494,7 +494,10 @@ Downstream, the turn did not reach the client as an error. `process_message_tool
 downgraded `finish_reason` to `stop` and handed over 5 525 characters of prose with
 `<tool_call>` and `{“name”: …` in it. The safety net §2.8 added did its job — no
 `InvalidStreamError`, no abort — but the model's answer was a *description* of a `write_file`
-it never got to perform, as plain text. That is the observable end of the session: last
+it never got to perform, as plain text. **§16 corrects the generalisation**: this window is not
+error-free — it carries two `InvalidStreamError` records (client-local 15:10:12 and 15:10:32) —
+and the net reaches one of the client's three abort conditions, not all three. What the net did
+here was let *this* turn end as prose; it does not close the error class. That is the observable end of the session: last
 inference request 19:29:52, no request after it, and nothing but a local `/stats` in the
 transcript.
 
@@ -590,4 +593,89 @@ Two follow-ons worth keeping:
    `api_error`" for the whole run; the field is `event.name == "qwen-code.api_error"`, and matching
    the bare substring `"api_error"` matched nothing. The count was 1 from the moment it happened.
    Count on the parsed field, not on a substring of its name.
+
+## 16. The error class the safety net does not close (2026-09-27)
+
+§14.3 says of the `e8ee13a8` glyph-loss turn: "no `InvalidStreamError`, no abort". The
+generalisation is wrong, and it is wrong in the two ways §15 warned about — a filtered count
+and a misread clock. Both were mine.
+
+The instrument first: `tabby_watch.py` tested `event.get("event.name") == "api_error"`, but the
+field is namespaced `qwen-code.api_error`. The bare test matched nothing, so **every** api_error
+in every transcript was invisible to the observer. A direct scan of all transcripts finds 171 of
+them; **11 are `InvalidStreamError`** / "Model response contained a malformed tool call." on this
+checkpoint (`DeepSeek-V4-Flash-0731-exl3-2.32bpw`), and **nine of them were proxy-served** — the
+two exceptions are the first rows below.
+
+| client-local | session | duration | proxy served it? |
+|---|---|---|---|
+| 2026-09-24 19:26:22 | `843f2fc7` | 18.4 s | **no — before the proxy's first request (09-25 13:50:41)** |
+| 2026-09-24 19:26:58 | `843f2fc7` | 11.6 s | no — as above |
+| 2026-09-25 19:39:18 | `0c1c9cb3` | 11.7 s | yes — POST 19:39:07 |
+| 2026-09-25 19:39:23 | `0c1c9cb3` | 2.4 s | yes — POST 19:39:20 |
+| 2026-09-25 19:39:32 | `0c1c9cb3` | 5.7 s | yes — POST 19:39:27 |
+| 2026-09-25 19:51:24 | `decb9d2e` | 4.0 s | yes — POST 19:51:20 |
+| 2026-09-25 19:51:44 | `08223956` | 20.0 s | yes — POST 19:51:24 |
+| 2026-09-25 19:56:21 | `decb9d2e` | 85.9 s | yes — POST 19:54:55 |
+| 2026-09-25 20:18:26 | `0faa6605` | 19.2 s | yes — POST 20:18:07 |
+| 2026-09-26 15:10:12 | `e8ee13a8` | 45.0 s | yes — POST 15:09:27 |
+| 2026-09-26 15:10:32 | `e8ee13a8` | 6.0 s | yes — POST 15:10:27 |
+
+Provenance is settled by **request start time**, not by the completion time: each client error
+stamp minus its own `duration_ms` lands on a proxy `POST` within 0.8 s. Both `e8ee13a8` rows are
+in the §14 window, but not at the 23:xx the section names — client-recorded times are EDT, and
+the proxy's own log shows the same minute (15:10:27) as `POST … 200 OK`. The clock was read one
+timezone over.
+
+**The mechanism, exactly.** The client aborts on three conditions, not one:
+
+```js
+if (choice.finish_reason && (
+      toolCallParser.hasInvalidToolCallIndex() ||
+      toolCallWithoutName ||
+      (choice.finish_reason === "tool_calls" && completedToolCalls.length === 0)
+   )) throw new InvalidStreamError("Model response contained a malformed tool call.", "MALFORMED_TOOL_CALL")
+```
+
+The §2.8 net covers only the third: it rewrites `finish_reason` to `stop` when the upstream said
+`tool_calls` and its own parser found nothing. It cannot reach `hasInvalidToolCallIndex()` or
+`toolCallWithoutName`, because those are decided by the client's **streaming** parser from deltas
+the proxy has already relayed — and they fire under either finish reason. The tightest evidence
+is the second `e8ee13a8` row: the proxy logged `Tool-call syntax present but unparsed` at
+`15:10:32.795` and the client raised the error at `15:10:32.796`. One millisecond, from the same
+completion: the proxy's offline parse failed *and* the client's live parse had by then seen a
+malformed call. A proxy that relays deltas — which this one does, deliberately, so the client is
+not silent for a whole generation (§2) — is structurally downstream of the failure it wants to
+prevent.
+
+**When the net began to work.** Every invocation of "reporting stop …" in the journal falls on
+2026-09-26 after 22:12 — eight of them, plus thirteen `unparsed` warnings from that evening. Not
+one is in the 09-25 19:xx or 09-26 15:10 windows. `git log -S` puts the net's text in `a3cff8d`
+(2026-09-26 16:09). In the 09-25 windows the deployed proxy was `d73f9ec`/`b80c7e9` (09-25
+13:23/13:33), roughly two hours old; at 15:10 it was between `74500ca` (19:16) and `34eb6d5`
+(19:38), still before the net existed.
+
+So the shape of it: the net is real and it works — it is **not** a general guard against this
+error class, because the client's two streaming-side conditions bypass it entirely. Nine client
+aborts under an old proxy do not test a net built later; the two `e8ee13a8` rows do, and the
+proxy-side log for those same completions shows the parse failing rather than being rescued.
+
+**What this reopens.** §8 and §14.4 claim the downgrade converted "a lost turn into a slow one".
+That holds for a completion the proxy *can* parse as nothing. It does not hold for a completion
+the proxy parses as *malformed* while holding back only 32 characters: the relayed prefix is
+already on the wire, so a client abort is decided before any end-of-turn correction can land.
+Two candidate directions, neither attempted:
+
+1. **Hold back from the first tool marker**, not the last 32 characters — emit the clean prefix
+   and no more until the turn resolves. Removes the incremental-delta win the streaming work
+   bought, so it is a real trade, not a free fix.
+2. **A local repair in the relay** — the `fold_typographic` work already recovers 6 of 7 calls
+   from one payload; applying it to the delta path before the client sees it would answer the
+   client's condition rather than the proxy's.
+
+**And the instrument, again.** The `tabby_watch.py` fix is one line — match
+`qwen-code.api_error`, the field itself, never a substring of its name. §15's second follow-on was
+written about the observer's own filter; this is the same bug, in the observer's own source, found
+only because the corrected filter was applied by hand first. The lesson generalises: an observer
+that counts by substring will report a clean run and mean nothing by it.
 
