@@ -1137,3 +1137,43 @@ Same subcase as before (a complete object, short of required keys), and the seco
 two batches. It is now the most *frequent* argument-layer fault on this probe, always caught by §18
 and always paired with a sibling that works.
 
+## 21. The repetition loop returns, 10× wider and in the wrong glyphs (2026-09-27 00:36)
+
+At `00:36:45` the probe's first **degenerate repetition collapse** of this session was captured
+live — the family §14.5(4) left open, now an order of magnitude wider. The trigger is legible: a
+`user` turn (14 chars, "work on item 6") landed at `04:34:50Z`, the model's **reasoning** for it is
+coherent — it correctly argues that a per-list resonance projection is expressible because the
+foundation already carries `peak_lists` plus a `_list_rows` peak→list relation, so item (6) "is
+already baked in" — and then the **completion** collapses.
+
+Measured on the raw bytes, not the rendered text (the tool layer rewrites angle-bracket runs and
+even the phrase below, so these counts come from ordinals and `repr` in-process):
+
+| field | length | repeated token | count |
+|---|---|---|---|
+| completion | 4 983 | `<｜DSML｜>` (ords 60, 65372, 68, 83, 77, 76, 65372, 62) | **98** |
+| completion | — | the sentence "I'll read the projection builder…" | 24 |
+| reasoning | 5 753 | `<shift_list>` | 5 |
+
+The repeated token is a **bare wrong-glyph wrapper opener** — the fullwidth `｜` (U+FF5C) form the
+`34eb6d5` recovery was written for, but with `DSML` as its only content and **no** keyword, `name`,
+or `tool_calls`. The recovery therefore correctly does *not* fire: there is no call inside the
+wrapper to recover. The scanner only marks the text (`DSML` / `\uff5c` present) and warns; the
+parser returns zero calls. The reasoning field carries a second fabricated tag, `<shift_list>` — an
+invented *markup* name (the same drift as the invented tool names of §3 and the fabricated
+`</tool_command>` closers of §20, now an invented element).
+
+This is §14.5(4) escalated. There, **nine** `<tool_call>` openers with no closers sat mid-completion
+and slipped past `_strip_repetition_tail` (which strips only a run at the very *tail*). Here the
+loop is **98** openers, the run *is* the whole completion, and the delimiters are the wrong-glyph
+wrapper rather than a JSON envelope. **The turn survived:** `finish_reason` came back `tool_calls`
+with zero parsed calls — §16's third abort trigger — and the deployed guard rewrote it to `stop`
+("Upstream said tool_calls but no call was parsed; reporting stop…"). The transcript confirms a clean
+end: assistant `04:36:45`, `textlen=10445`, `calls=[]`, a `qwen-code.api_response`, **no `api_error`,
+no abort**. The cost is an idle session awaiting a nudge, not a lost turn.
+
+Open, and not fixed: whether a mid-text repetition run of *delimiters* should be collapsed so the
+client renders an end-of-turn instead of a 10 KB wall. The prose between the delimiters is real text
+the model wrote, so a naive collapse would discard content; the delimiters alone are safe to drop but
+are also the only signal that distinguishes this collapse from ordinary prose. Recorded as open.
+
