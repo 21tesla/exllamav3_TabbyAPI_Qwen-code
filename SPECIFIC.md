@@ -931,10 +931,15 @@ a content error require a retry loop; the parallel call covered it, exactly as �
 errors that sit at position 0 of a widened batch.
 
 **Where this leaves the glyph-regime watch.** The prediction was that the first turn past 180k
-would expose the mangled-glyph class. The first two turns past 185k did not: the only non-ASCII in
-either the calls or the refusals is the model's own legitimate `§`/`→`/`−` from the analysis-qt6
-annotation style. The regime has not arrived at 185k in this session, and the two refusals are a
-different defect entirely.
+would expose the mangled-glyph class. The turns past 180k did not: at 185k, 194.6k and 196.8k
+input tokens the calls stayed clean, and the only non-ASCII in the calls or the refusals is the
+model's own legitimate `§`/`→`/`−` from the analysis-qt6 annotation style. That matters because
+**196 756 tokens is past the point where the second probe lost all seven calls** (195 432, §14) —
+so the loss is not a plain threshold at 195k either, or the two probes differ in some other
+variable. One caveat keeps this from being over-read: the turns above 195k were *small* — a
+two-call `edit` pair and a one-call recovery `read_file` — so what is untested is the large-batch
+behaviour in this band, which is exactly the regime §14's loss occurred in. The regime has not
+been shown absent above 195k; it has been shown absent for small turns.
 
 **`invalid_tool_params` is a family, and the layer decides the sub-kind.** These two events and
 §18's eight split by which component can see the fault:
