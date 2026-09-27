@@ -64,6 +64,20 @@ _TAG_RE = re.compile(r"<[^<>]{0,200}>")
 _ATTR_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*[\"\x27]([^\"\x27]*)[\"\x27]")
 _CALL_TAGS = {"tool_call", "tool_calls", "tool", "invoke", "function", "function_call"}
 _PARAM_TAGS = {"parameter", "param"}
+# A container element holding the whole arguments object, rather than one named
+# parameter. The checkpoint writes this dialect alongside the `name=` attribute on
+# the call tag (observed 2026-09-26, live probe e5e8c7f9, first turn):
+#
+#   <tool_call>
+#   <|DSML| name="read_file">
+#   <arguments>{"file_path": "/home/logan/software/analysis-qt6/stage141.txt"}</arguments>
+#   </|DSML|>
+#   </tool_call>
+#
+# Without this the tag is not a parameter, its JSON is never collected, and the
+# call is emitted with empty arguments -- which the client rejects as
+# `invalid_tool_params` and retries.
+_ARG_CONTAINER_TAGS = {"arguments", "args"}
 _CALL_NAME_KEYS = {"name", "tool", "tool_name", "function"}
 # Keys that describe a call rather than populate its arguments. A sibling key that
 # is not one of these and not the arguments container is a parameter the model left
@@ -159,13 +173,15 @@ def split_dsml_tag(tag: str) -> Tuple[str, bool, Dict[str, str], bool]:
 
 
 def classify_dsml_tag(keyword: str, is_closing: bool, attrs: Dict[str, str], was_dsml: bool) -> str:
-    """Map a tag to one of: call, param, close, other."""
+    """Map a tag to one of: call, param, args, close, other."""
     if is_closing:
         return "close"
     if keyword in _CALL_TAGS:
         return "call"
     if keyword in _PARAM_TAGS:
         return "param"
+    if keyword in _ARG_CONTAINER_TAGS:
+        return "args"
     if was_dsml and not is_closing and (attrs.get("name") or keyword):
         # A DSML tag carrying a keyword is normally the `name`-as-tag-name dialect
         # (`<|DSML|read_file>`), so it reads as a call. A keyword beginning with `_`
@@ -189,12 +205,33 @@ def _close_dsml_frame(stack: List[dict], keyword: str, calls: List[dict]) -> Non
             break
         if frame["kind"] == "param" and keyword in _PARAM_TAGS:
             break
+        if frame["kind"] == "args" and keyword in _ARG_CONTAINER_TAGS:
+            break
         idx -= 1
     else:
         return
 
     frame = stack.pop(idx)
-    if frame["kind"] == "param":
+    if frame["kind"] == "args":
+        # The container carries the arguments object itself, so its members are the
+        # call's parameters, merged whole rather than filed under one key. The body
+        # is JSON, parsed with the same repair the bracketed forms use: the
+        # checkpoint drops a closing brace there too, and a container whose braces
+        # do not balance would otherwise contribute nothing at all.
+        body = "".join(frame["raw"]).strip()
+        parsed = None
+        if body:
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                parsed = repair_truncated_json(body)
+        if isinstance(parsed, dict):
+            frame["args"].update(parsed)
+        for parent in reversed(stack):
+            if parent["kind"] == "call":
+                parent["args"].update(frame["args"])
+                break
+    elif frame["kind"] == "param":
         value = "".join(frame["buf"]).strip()
         if value:
             try:
@@ -223,6 +260,8 @@ def parse_dsml_tool_calls(content: str) -> Tuple[List[dict], Optional[int]]:
     for match in _TAG_RE.finditer(content):
         if stack and stack[-1]["kind"] == "param":
             stack[-1]["buf"].append(content[cursor:match.start()])
+        elif stack and stack[-1]["kind"] == "args":
+            stack[-1]["raw"].append(content[cursor:match.start()])
         cursor = match.end()
 
         keyword, is_closing, attrs, was_dsml = split_dsml_tag(fold_dsml_syntax(match.group(0)))
@@ -236,11 +275,17 @@ def parse_dsml_tool_calls(content: str) -> Tuple[List[dict], Optional[int]]:
             stack.append({"kind": "param", "name": attrs.get("name") or "arg", "buf": []})
             if first is None:
                 first = match.start()
+        elif kind == "args":
+            stack.append({"kind": "args", "args": {}, "raw": []})
+            if first is None:
+                first = match.start()
         elif kind == "close":
             _close_dsml_frame(stack, keyword, calls)
 
     if stack and stack[-1]["kind"] == "param":
         stack[-1]["buf"].append(content[cursor:])
+    elif stack and stack[-1]["kind"] == "args":
+        stack[-1]["raw"].append(content[cursor:])
     while stack:
         _close_dsml_frame(stack, "", calls)
 
@@ -2044,6 +2089,48 @@ def _selftest() -> int:
         failures += 1
         print(f"     expected: [(0, 'read_file', {split_args!r})] finish='tool_calls'")
 
+    # The `<arguments>` container element: the checkpoint writes the arguments
+    # object inside a tag of that name instead of one `<parameter name=...>` per
+    # argument. Captured verbatim from the live probe e5e8c7f9 (2026-09-26, its
+    # first turn): the tag was not a parameter, so its JSON was never collected
+    # and the call went out with empty arguments -- which the client rejects as
+    # `invalid_tool_params` and makes the model retry the identical call. The
+    # known-good `<parameter>` dialect must keep working, and prose that merely
+    # mentions the tag must not invent a call.
+    arg_container = (
+        "<tool_call>\n"
+        f'<{fw}DSML{fw} name="read_file">\n'
+        '<arguments>{"file_path": "/home/logan/software/analysis-qt6/stage141.txt"}</arguments>\n'
+        f"</{fw}DSML{fw}>\n"
+        "</tool_call>"
+    )
+    arg_parameter = (
+        "<tool_call>\n"
+        f'<{fw}DSML{fw} name="read_file">\n'
+        '<parameter name="file_path">/tmp/stage123.txt</parameter>\n'
+        f"</{fw}DSML{fw}>\n"
+        "</tool_call>"
+    )
+    arg_cases = [
+        ("arguments element is read",
+         arg_container,
+         [("read_file", {"file_path": "/home/logan/software/analysis-qt6/stage141.txt"})]),
+        ("parameter element still reads",
+         arg_parameter,
+         [("read_file", {"file_path": "/tmp/stage123.txt"})]),
+        ("prose mentioning the tag is not a call",
+         "The <arguments> tag holds the call's values.",
+         None),
+    ]
+    for name, raw, expected in arg_cases:
+        calls, _cleaned = extract_tool_calls(raw)
+        got = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in (calls or [])]
+        ok = got == (expected or [])
+        print(f"{'ok  ' if ok else 'FAIL'} arguments container {name}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -2059,6 +2146,7 @@ def _selftest() -> int:
         + len(glyph_cases)
         + 2
         + 2
+        + len(arg_cases)
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
