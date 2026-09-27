@@ -62,7 +62,11 @@ _DSML_ESCAPED_BAR = re.compile(r"(?i)\\uff5c")
 _DSML_ESCAPED_UNDERSCORE = re.compile(r"(?i)\\u2581")
 _TAG_RE = re.compile(r"<[^<>]{0,200}>")
 _ATTR_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*[\"\x27]([^\"\x27]*)[\"\x27]")
-_CALL_TAGS = {"tool_call", "tool_calls", "tool", "invoke", "function", "function_call"}
+# An attribute whose value is a brace object rather than a quoted string, e.g.
+# `args={"file_path": "/x"}`. The braces balance one level; a nested object inside
+# would end the match early, which the caller's JSON repair then covers.
+_ATTR_OBJ_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*(\{[^{}]*\})")
+_CALL_TAGS = {"tool_call", "tool_calls", "calls", "call_tool", "tool", "invoke", "function", "function_call"}
 _PARAM_TAGS = {"parameter", "param"}
 # A container element holding the whole arguments object, rather than one named
 # parameter. The checkpoint writes this dialect alongside the `name=` attribute on
@@ -79,9 +83,13 @@ _PARAM_TAGS = {"parameter", "param"}
 # `invalid_tool_params` and retries.
 _ARG_CONTAINER_TAGS = {"arguments", "args"}
 _CALL_NAME_KEYS = {"name", "tool", "tool_name", "function"}
-# Keys that describe a call rather than populate its arguments. A sibling key that
-# is not one of these and not the arguments container is a parameter the model left
-# outside `arguments`; see normalize_tool_call_dict.
+# Keys whose *value* is the arguments object or the arguments JSON, when they ride
+# on the call tag as attributes rather than as child elements. The `call_tool`
+# dialect carries both the name and the whole argument object as attributes
+# (`<|DSML|call_tool name="read_file" args={...}>`), so `args` and `arguments` have
+# to be readable from `attrs` -- while the `parameter` sibling keeps its value as an
+# ordinary argument named `args`.
+_CALL_ARGS_KEYS = {"args", "arguments"}
 _CALL_META_KEYS = {"name", "function", "tool", "tool_name", "action", "type", "id"}
 
 
@@ -165,6 +173,12 @@ def split_dsml_tag(tag: str) -> Tuple[str, bool, Dict[str, str], bool]:
     if is_closing:
         body = body[1:].strip()
     attrs = {k.lower(): v for k, v in _ATTR_RE.findall(body)}
+    # An attribute whose value is a brace object is not quoted, so the regex above
+    # skips it -- and that is exactly how the `call_tool` dialect carries its
+    # arguments (`args={...}`). Capture the balanced braces separately; the nested
+    # braces of the object itself keep `[^{}]` from stopping at the first inner one.
+    for key, value in _ATTR_OBJ_RE.findall(body):
+        attrs.setdefault(key.lower(), value)
     was_dsml = bool(_DSML_WORD.search(body))
     body = _DSML_WORD.sub(" ", _DSML_BARS.sub(" ", body)).strip()
     match = re.match(r"[A-Za-z_][\w.\-]*", body)
@@ -250,6 +264,30 @@ def _close_dsml_frame(stack: List[dict], keyword: str, calls: List[dict]) -> Non
         calls.append({"name": frame["name"], "arguments": frame["args"]})
 
 
+def _parse_attr_arguments(value: str) -> Dict[str, Any]:
+    """Read an argument object carried as an attribute value.
+
+    The `call_tool` dialect writes `<|DSML|call_tool name="read_file" args={...}>`,
+    so the object arrives as an attribute rather than as a child element. It is
+    plain JSON, except that the value sat inside a `"`-quoted attribute, so the
+    model's own quotes around its keys may have been consumed by `_ATTR_RE` --
+    accept bare keys as well as quoted ones. A dropped closing brace lands here
+    too, so the same repair the bracketed forms use applies.
+    """
+    value = (value or "").strip()
+    if not value:
+        return {}
+    bare_keys = re.sub(r"([{,])\s*([A-Za-z_]\w*)\s*:", r'\1"\2":', value)
+    for candidate in (value, bare_keys):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            parsed = repair_truncated_json(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
 def parse_dsml_tool_calls(content: str) -> Tuple[List[dict], Optional[int]]:
     """Extract DSML tool calls; also return the offset where the syntax begins."""
     calls: List[dict] = []
@@ -268,7 +306,15 @@ def parse_dsml_tool_calls(content: str) -> Tuple[List[dict], Optional[int]]:
         kind = classify_dsml_tag(keyword, is_closing, attrs, was_dsml)
         if kind == "call":
             name = attrs.get("name") or (keyword if keyword not in _CALL_TAGS else None)
-            stack.append({"kind": "call", "name": name, "args": {}})
+            frame = {"kind": "call", "name": name, "args": {}}
+            # The `call_tool` dialect carries the whole argument object as an
+            # attribute rather than as a child element; fold it in so the call is
+            # not emitted with empty arguments.
+            for args_key in _CALL_ARGS_KEYS:
+                if args_key in attrs:
+                    frame["args"].update(_parse_attr_arguments(attrs[args_key]))
+                    break
+            stack.append(frame)
             if first is None:
                 first = match.start()
         elif kind == "param":
@@ -945,8 +991,14 @@ def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str
     return None, content
 
 
-def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[list] = None):
-    """Parses thinking tags and extracts tool calls from message content or reasoning_content."""
+def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[list] = None, native: bool = False):
+    """Parses thinking tags and extracts tool calls from message content or reasoning_content.
+
+    `native` says the caller is also holding a call that arrived over the upstream's
+    native `tool_calls` channel, which this function cannot see because it only reads
+    the two text fields. It suppresses the "no call was parsed" verdict and leaves
+    the finish reason for the caller to settle after it has merged the native call.
+    """
     content = msg.get("content")
     reasoning = msg.get("reasoning_content")
 
@@ -1003,7 +1055,7 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
             return
 
 
-    if not extracted_calls:
+    if not extracted_calls and not native:
         raw = content or reasoning or ""
         marked = "DSML" in raw or "<tool_call" in raw or "\\uff5c" in raw
         if marked:
@@ -1314,7 +1366,7 @@ async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient,
 
     message = {"role": "assistant", "content": content_text or None, "reasoning_content": reasoning_text or None}
     choice = {"index": index, "finish_reason": finish_reason}
-    process_message_tools_and_thinking(message, choice, tools)
+    process_message_tools_and_thinking(message, choice, tools, native=bool(native_tool_calls))
     final_content = message.get("content")
     final_reasoning = message.get("reasoning_content")
     # A native call settles the finish reason: the upstream said `tool_calls`
@@ -1480,13 +1532,11 @@ async def chat_completions_proxy(request: Request):
             msg = choice.get("message", {})
             # TabbyAPI can hand back a native call here (its `deepseek_v4` format
             # parses the checkpoint's DSML server-side), where the text fields hold
-            # nothing to scrape. Surface it so the processor sees it and leaves the
-            # finish reason alone; without this the empty-call guard below would
-            # downgrade a perfectly good call to `stop`.
-            native = msg.get("tool_calls")
-            if native and not msg.get("content") and not msg.get("reasoning_content"):
-                msg["content"] = json.dumps({"tool_calls": native})
-            process_message_tools_and_thinking(msg, choice, tools)
+            # nothing to scrape. Tell the processor so, and leave the finish reason
+            # for the guard below: with the processor silenced the call is already in
+            # `msg`, so the guard sees it and holds.
+            native = bool(msg.get("tool_calls"))
+            process_message_tools_and_thinking(msg, choice, tools, native=native)
             # Same guard as the streaming path: a finish reason of `tool_calls`
             # with an empty list is read as a malformed call and ends the turn.
             if choice.get("finish_reason") == "tool_calls" and not msg.get("tool_calls"):
@@ -2131,6 +2181,65 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
+    # Two more shapes from the same live probe (2026-09-26), both of which produced
+    # a call the client refused. `call_tool` carries the name *and* the whole
+    # argument object as attributes, so the object was never read; the `calls`
+    # wrapper (a DSML element named for the plural) yielded a call literally called
+    # `calls`, which no registry has. The `parameter`-named-`args` leg is the
+    # guard against reading the new attribute key too eagerly: there `args` is a
+    # genuine argument name and its value must stay filed under it.
+    round3_cases = [
+        ("call_tool name+args attributes are read",
+         "<tool_call>\n"
+         f'<{fw}DSML{fw}call_tool name="read_file" args={{"file_path": "/tmp/a.py", "offset": 3720, "limit": 130}}>\n'
+         f"</{fw}DSML{fw}call_tool>\n</tool_call>",
+         [("read_file", {"file_path": "/tmp/a.py", "offset": 3720, "limit": 130})]),
+        ("DSML calls wrapper does not become a call",
+         "<tool_call>\n"
+         f"<{fw}DSML{fw}calls>\n"
+         '<tool_call>\n{"name": "read_file", "arguments": {"file_path": "/tmp/b.py"}}\n'
+         f"</{fw}DSML{fw}calls>\n"
+         '<tool_call>\n{"name": "glob", "arguments": {"pattern": "src/**"}}\n</tool_call>',
+         [("read_file", {"file_path": "/tmp/b.py"}), ("glob", {"pattern": "src/**"})]),
+        ("a parameter named args is not swallowed",
+         "<tool_call>\n"
+         f'<{fw}DSML{fw} name="read_file">\n'
+         '<parameter name="args">{"a": 1}</parameter>\n'
+         f"</{fw}DSML{fw}>\n</tool_call>",
+         [("read_file", {"args": {"a": 1}})]),
+    ]
+    for name, raw, expected in round3_cases:
+        calls, _cleaned = extract_tool_calls(raw)
+        got = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in (calls or [])]
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} round3 {name}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
+    # The "no call was parsed" verdict is a claim about the two text fields, so it
+    # must not be made on a turn whose call arrived over the native channel -- the
+    # processor cannot see that channel, and emitting the line for a call that was
+    # in fact delivered is a false alarm in the log (observed live 2026-09-26: the
+    # three native calls of session e5e8c7f9 each logged it, yet all reached the
+    # client). The finish reason must also be left alone in that case, since the
+    # caller settles it once it has merged the native call.
+    native_msg = {"content": "Let me read it.", "reasoning_content": None}
+    native_choice = {"finish_reason": "tool_calls"}
+    captured = []
+    original_warning = logger.warning
+    logger.warning = lambda message, *a, **k: captured.append(str(message))
+    try:
+        process_message_tools_and_thinking(native_msg, native_choice, None, native=True)
+    finally:
+        logger.warning = original_warning
+    quiet = not any("no call was parsed" in m for m in captured)
+    held_reason = native_choice["finish_reason"] == "tool_calls"
+    print(f"{'ok  ' if quiet and held_reason else 'FAIL'} native flag silences the verdict: quiet={quiet} finish={native_choice['finish_reason']!r}")
+    if not (quiet and held_reason):
+        failures += 1
+        print(f"     expected quiet=True finish='tool_calls'; warnings={captured!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -2147,6 +2256,8 @@ def _selftest() -> int:
         + 2
         + 2
         + len(arg_cases)
+        + len(round3_cases)
+        + 1
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
