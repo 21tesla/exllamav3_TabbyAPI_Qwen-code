@@ -119,6 +119,64 @@ _CALL_NAME_KEYS = {"name", "tool", "tool_name", "function"}
 # ordinary argument named `args`.
 _CALL_ARGS_KEYS = {"args", "arguments"}
 _CALL_META_KEYS = {"name", "function", "tool", "tool_name", "action", "type", "id"}
+# Element keywords that name a *field* of a call dialect rather than a tool. No
+# tool is named for a field, so a bare `<|DSML|name>` (the call name's own element,
+# see `_NAME_ELEM_OPEN_RE`), a `<|DSML|output>` (the fabricated-result marker) or a
+# `<tool_name>` (the name element of the XML-ish dialect) is structural markup, not
+# a call. The `declared` check in `classify_dsml_tag` already refuses these when the
+# request advertises a tool list; this closes the no-declared-tools case, where the
+# guess branch would otherwise emit a call named `name` beside the real one.
+_STRUCTURAL_TAGS = {"name", "output", "tool_name"}
+
+# The `name`-element dialect: the call name rides its own element --
+# `<|DSML|name>` + the name + `</|DSML|name>` -- rather than a tag name
+# (`<|DSML|read_file>`) or a `name=` attribute. Captured verbatim 2026-09-27
+# (analysis-qt6, session 1c997e7d, both completions that killed the session):
+#
+#   <|DSML|name>edit</|DSML|name>
+#   <|DSML|arguments>{...}</|DSML|arguments>
+#
+#   <|DSML|name>read_file</|DSML|name>
+#   <|DSML|arguments>{...}</|DSML|arguments>
+#   <|DSML|name>read_file</|DSML|arguments>{...}</|DSML|arguments>
+#
+# The main tag scanner cannot read it: `<|DSML|name>` is not a `_CALL_TAGS`
+# keyword and carries no `name=` attribute, so it classifies as `other` and is
+# dropped; the `</|DSML|name>` closer then matches no open frame either, so the
+# whole turn -- `edit` + `read_file` + `read_file` in the two captures -- parsed
+# to *no call at all*. `process_message_tools_and_thinking` answered `stop` for a
+# `tool_calls` turn, the client saw a turn that neither called a tool nor closed
+# the loop, and the model's next reply announced work whose results it had never
+# received. The bar accepts all three spellings the scanner's `_DSML_BARS` does:
+# ASCII `|`, the fullwidth U+FF5C it drifts into, and the model's *escaped*
+# `\uff5c` literal.
+_DSML_BAR = r"(?:[|\uff5c]|\\uff5c)"
+_NAME_ELEM_OPEN_RE = re.compile(
+    r"<" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*name\s*>", re.IGNORECASE
+)
+# The name itself, and the optional closer the model sometimes omits. Anchored with
+# `match` at the opener's end, so it takes only the name token that follows -- a
+# name element in prose therefore yields the word beside it, which is why the
+# argument block below must still be present for a call to be emitted.
+_NAME_ELEM_BODY_RE = re.compile(
+    r"\s*([A-Za-z_][\w.\-]*)\s*(?:</"
+    + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*name\s*>)?"
+)
+_NAME_ELEM_ARGS_RE = re.compile(
+    r"<" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*arguments\s*>", re.IGNORECASE
+)
+# The per-argument spelling, for a call that names its parameters as attributes
+# (`<|DSML|param file_path="/a.py" offset="60">`) or as named elements
+# (`<|DSML|parameter name="file_path">/a.py</|DSML|parameter>`).
+_NAME_ELEM_PARAM_ATTR_RE = re.compile(
+    r"<" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*param(?:eter)?\s+([^<>]*)>",
+    re.IGNORECASE,
+)
+_NAME_ELEM_PARAM_NAME_RE = re.compile(
+    r"<" + _DSML_BAR + r"\s*DSML\s*" + _DSML_BAR + r"\s*param(?:eter)?\s+name\s*=\s*"
+    r"[\"']([^\"']+)[\"']\s*>\s*(.*?)\s*</",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # The checkpoint sometimes names an argument in its own words rather than the
 # schema's -- observed 2026-09-26 writing `path` for `read_file`'s `file_path`.
@@ -262,6 +320,12 @@ def classify_dsml_tag(
     # seven the model wrote (the duplicate signature deduped the rest away).
     if not is_closing and not was_dsml and keyword and not attrs:
         return "element"
+    # A structural field keyword (`name`, `output`, `tool_name`) is part of a call's
+    # own markup, never the tool's name; see `_STRUCTURAL_TAGS`. Refused ahead of the
+    # guessing branch below so a request that declared no tool list cannot invent a
+    # call from one -- the `declared` check there only covers the declared case.
+    if not is_closing and keyword in _STRUCTURAL_TAGS and not attrs:
+        return "other"
     if was_dsml and not is_closing and (attrs.get("name") or keyword):
         # A DSML tag carrying a keyword is normally the `name`-as-tag-name dialect
         # (`<|DSML|read_file>`), so it reads as a call. A keyword beginning with `_`
@@ -521,6 +585,104 @@ def parse_dsml_tool_calls(
                 )
                 break
 
+    return calls, first
+
+
+def _first_json_object(content: str, start: int, end: int) -> Tuple[Optional[Any], int]:
+    """The first JSON value in `content[start:end]`, read the way the main scan reads one.
+
+    Returns `(value, resume_offset)` and `(None, start)` when the slice holds no
+    parseable value. The typographic fold, the truncated-closer repair and the
+    bare-quote repair are tried in the same order and for the same reasons as the
+    scanner's own bracket walk -- a `name`-element call's argument object is the same
+    object and mangles the same ways -- so the two paths cannot drift on how they
+    read it.
+    """
+    decoder = json.JSONDecoder(strict=False)
+    idx = start
+    while idx < end:
+        if content[idx] in "{[":
+            for text in (content, fold_typographic(content)):
+                try:
+                    obj, used = decoder.raw_decode(text, idx)
+                    return obj, used
+                except Exception:
+                    pass
+            for limit in _fragment_ends(content, idx):
+                if limit > end:
+                    continue
+                repaired = repair_truncated_json(content[idx:limit])
+                if repaired is not None:
+                    return repaired, limit
+            for limit in _fragment_ends(content, idx):
+                if limit > end:
+                    continue
+                repaired = repair_unescaped_quotes(content[idx:limit])
+                if repaired is not None:
+                    return repaired, limit
+            return None, start
+        idx += 1
+    return None, start
+
+
+def _name_element_args(content: str, start: int, end: int) -> Optional[dict]:
+    """The arguments of one `name`-element call, or None when the block carries none.
+
+    Three spellings reach here and all three are read, in the order the model is
+    most likely to have meant them: the `arguments` element's JSON object, a bare
+    JSON object, and per-argument children (`param file_path="..."`). Nothing but
+    prose between the name and the next name returns None, which is what keeps a
+    *mention* of the dialect -- a model quoting its own syntax in an explanation --
+    from being read as a call.
+    """
+    args_open = _NAME_ELEM_ARGS_RE.search(content, start, end)
+    if args_open:
+        obj, _used = _first_json_object(content, args_open.end(), end)
+        if isinstance(obj, dict):
+            return obj
+    obj, _used = _first_json_object(content, start, end)
+    if isinstance(obj, dict) and obj:
+        return obj
+    params: Dict[str, Any] = {}
+    for match in _NAME_ELEM_PARAM_ATTR_RE.finditer(content, start, end):
+        for key, dq, sq, obj_attr in _ATTR_RE.findall(match.group(1)):
+            if key.lower() in _CALL_META_KEYS:
+                continue
+            params[key] = dq or sq or obj_attr
+    for match in _NAME_ELEM_PARAM_NAME_RE.finditer(content, start, end):
+        if match.group(1).lower() in _CALL_META_KEYS:
+            continue
+        params[match.group(1)] = match.group(2)
+    return params or None
+
+
+def parse_name_element_tool_calls(content: str) -> Tuple[List[dict], Optional[int]]:
+    """Extract the `name`-element dialect; also return where its syntax begins.
+
+    The name rides its own element and no enclosing `<tool_call>` is required --
+    captured live without one -- so this walk is driven by the name elements
+    themselves, each one's block running to the next. A call is emitted only when
+    the block also carries an argument object or per-argument children; the
+    argument-object requirement is what distinguishes a real call from a lone
+    `<|DSML|name>` in prose. See `_NAME_ELEM_OPEN_RE` for the captures and why the
+    main scanner cannot read this form.
+    """
+    openers = list(_NAME_ELEM_OPEN_RE.finditer(content))
+    if not openers:
+        return [], None
+    calls: List[dict] = []
+    first: Optional[int] = None
+    for i, opener in enumerate(openers):
+        block_end = openers[i + 1].start() if i + 1 < len(openers) else len(content)
+        body = _NAME_ELEM_BODY_RE.match(content, opener.end())
+        if not body:
+            continue
+        args = _name_element_args(content, body.end(), block_end)
+        if not args:
+            continue
+        calls.append({"name": body.group(1), "arguments": args})
+        if first is None:
+            first = opener.start()
     return calls, first
 
 
@@ -1376,6 +1538,10 @@ def extract_tool_calls(
         re.compile(r"(?i)\\uff5c\s*DSML"),
         re.compile(r"\[tool_call\s*:", re.IGNORECASE),
         re.compile(r"```(?:tool_call|json)?\s*\{", re.IGNORECASE),
+        # The `name`-element opener, which may arrive with no `<tool_call>` wrapper
+        # at all (see `parse_name_element_tool_calls`); without it `first_start`
+        # stays past the syntax and the cleaned prose keeps a marker in it.
+        _NAME_ELEM_OPEN_RE,
     ]
     for pat in marker_patterns:
         m = pat.search(content)
@@ -1389,6 +1555,26 @@ def extract_tool_calls(
         first_start = min(first_start, dsml_start)
     for dsml_call in dsml_calls:
         add_call(dsml_call["name"], dsml_call["arguments"])
+
+    # 1b. The `name`-element dialect, which the scanner above cannot read because its
+    # opener carries neither a `_CALL_TAGS` keyword nor a `name=` attribute. Kept as
+    # its own pass rather than folded into the scanner: the dialect needs no enclosing
+    # `<tool_call>` and spans raw `{`...`}` text that the scanner would treat as frame
+    # content. See `parse_name_element_tool_calls`.
+    name_calls, name_start = parse_name_element_tool_calls(content)
+    if name_start is not None:
+        first_start = min(first_start, name_start)
+    if name_calls:
+        # Positive trace, for the reason §19 gives: the raw dump fires only on failure,
+        # so a dialect that reads correctly would otherwise leave no record that it was
+        # ever seen -- a turn that parsed and a turn whose text never held this dialect
+        # would look the same in the journal.
+        logger.info(
+            "Read %d tool call(s) from the 'name'-element dialect: %s",
+            len(name_calls), [c["name"] for c in name_calls],
+        )
+    for name_call in name_calls:
+        add_call(name_call["name"], name_call["arguments"])
 
 
     # 2. JSON objects/arrays scanning using raw_decode
@@ -2779,6 +2965,66 @@ def _selftest() -> int:
         failures += 1
         print(f"     expected: [(0, 'read_file', {split_args!r})] finish='tool_calls'")
 
+    # The `name`-element dialect over the *streaming* path, which is where the probe
+    # meets it. The completion is split mid-tag (`<` then `|DSML|name>`, and a broken
+    # `</|DSML|` then `arguments>`), so the hold-back has to latch on the opener and
+    # the emitted call has to survive that split. No native call is present: the call
+    # is scraped from the text, so this also pins that the finish reason is settled by
+    # the intercepted call rather than downgraded to `stop`.
+    name_stream_args = '{"file_path": "/tmp/a.py", "old_string": "x", "new_string": "y"}'
+    name_delta_events = [
+        _evt({"role": "assistant"}),
+        _evt({"content": "The table is hidden; `self.table`.\n\n<"}),
+        _evt({"content": f"{fw}DSML{fw}name>edit</{fw}DSML{fw}name>\n"}),
+        _evt({"content": f"<{fw}DSML{fw}arguments>" '{"file_path": "/tmp/a.py", "old_string": "x",'}),
+        _evt({"content": '"new_string": "y"}</' + f"{fw}DSML{fw}arguments>"}),
+        _evt({}, finish="tool_calls", eos="eos"),
+        "data: [DONE]",
+    ]
+
+    async def _drive_name():
+        collected = []
+        async for chunk in stream_tools_response(
+            _NoopCtx(), _FakeStream(name_delta_events), _NoopClient(), "test-model", None
+        ):
+            collected.append(chunk)
+        return collected
+
+    name_seen_calls = []
+    name_seen_finish = None
+    name_prose = ""
+    for chunk in asyncio.run(_drive_name()):
+        if not chunk.startswith("data: "):
+            continue
+        body = chunk[len("data: "):].strip()
+        if not body or body == "[DONE]":
+            continue
+        event = json.loads(body)
+        for choice in event.get("choices", []):
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                name_prose += delta["content"]
+            for call in delta.get("tool_calls") or []:
+                name_seen_calls.append((call["function"]["name"], call["function"]["arguments"]))
+            if choice.get("finish_reason"):
+                name_seen_finish = choice["finish_reason"]
+    name_stream_ok = (
+        name_seen_calls == [("edit", name_stream_args)]
+        and name_seen_finish == "tool_calls"
+        and "The table is hidden" in name_prose
+        and "DSML" not in name_prose
+    )
+    print(
+        f"{'ok  ' if name_stream_ok else 'FAIL'} name-element over the stream: "
+        f"calls={name_seen_calls} finish={name_seen_finish!r} prose={name_prose!r}"
+    )
+    if not name_stream_ok:
+        failures += 1
+        print(
+            f"     expected: [('edit', {name_stream_args!r})] finish='tool_calls' "
+            "with the prose emitted and no markup leaked"
+        )
+
     # The `<arguments>` container element: the checkpoint writes the arguments
     # object inside a tag of that name instead of one `<parameter name=...>` per
     # argument. Captured verbatim from the live probe e5e8c7f9 (2026-09-26, its
@@ -3146,6 +3392,125 @@ def _selftest() -> int:
         failures += 1
         print(f"     captured {captured!r}")
 
+    # The `name`-element dialect, added 2026-09-27 after session 1c997e7d: the call
+    # name rides its own element, the scanner classified every tag `other`, and the
+    # two completions that killed the session parsed to *no* call at all. The
+    # fixtures are the captured completions, reduced to their markup; the bar spellings
+    # are exercised because the capture used the fullwidth U+FF5C.
+    name_bar = fw
+    name_edit = (
+        "The table is hidden; the visible table is `self.table`.\n"
+        "<tool_call>\n"
+        f"<{name_bar}DSML{name_bar}name>edit</{name_bar}DSML{name_bar}name>\n"
+        f"<{name_bar}DSML{name_bar}arguments>"
+        '{"file_path": "/tmp/a.py", "old_string": "x", "new_string": "y"}'
+        f"</{name_bar}DSML{name_bar}arguments>\n"
+        f"</{name_bar}DSML{name_bar}tool_call>"
+    )
+    # The second half of the capture: the second name element's `</…arguments>` opener is
+    # missing, so `arguments` and its JSON sit right after the name and the closer the
+    # model *did* write is a stray `</…arguments>`. Both calls must still come out.
+    name_pair = (
+        "The last two edits' confirmations were not shown.\n"
+        f"<{name_bar}DSML{name_bar}name>read_file</{name_bar}DSML{name_bar}name>\n"
+        f"<{name_bar}DSML{name_bar}arguments>"
+        '{"file_path": "/tmp/a.py", "limit": "20", "offset": "303"}'
+        f"</{name_bar}DSML{name_bar}arguments>\n"
+        f"<{name_bar}DSML{name_bar}name>read_file</{name_bar}DSML{name_bar}arguments>"
+        '{"file_path": "/tmp/a.py", "limit": "20", "offset": "822"}'
+        f"</{name_bar}DSML{name_bar}arguments>\n"
+        f"<{name_bar}DSML{name_bar}output></{name_bar}DSML{name_bar}output>"
+    )
+    name_element_cases = [
+        ("a name element with an arguments block is a call", name_edit,
+         [("edit", {"file_path": "/tmp/a.py", "old_string": "x", "new_string": "y"})],
+         "The table is hidden; the visible table is `self.table`."),
+        ("a second name missing its closer still pairs with its arguments", name_pair,
+         [("read_file", {"file_path": "/tmp/a.py", "limit": "20", "offset": "303"}),
+          ("read_file", {"file_path": "/tmp/a.py", "limit": "20", "offset": "822"})],
+         "The last two edits' confirmations were not shown."),
+        ("the escaped-bar spelling is read", name_edit.replace(name_bar, "\\uff5c"),
+         [("edit", {"file_path": "/tmp/a.py", "old_string": "x", "new_string": "y"})],
+         "The table is hidden; the visible table is `self.table`."),
+        ("an ASCII-bar spelling is read", name_edit.replace(name_bar, "|"),
+         [("edit", {"file_path": "/tmp/a.py", "old_string": "x", "new_string": "y"})],
+         "The table is hidden; the visible table is `self.table`."),
+        ("a truncated argument object is repaired",
+         f"<{name_bar}DSML{name_bar}name>write_file</{name_bar}DSML{name_bar}name>"
+         f"<{name_bar}DSML{name_bar}arguments>" '{"file_path": "/tmp/a.py", "content": "x"' "</",
+         [("write_file", {"file_path": "/tmp/a.py", "content": "x"})], None),
+        ("per-argument elements are read when no object is present",
+         f"<{name_bar}DSML{name_bar}name>read_file</{name_bar}DSML{name_bar}name>"
+         f'<{name_bar}DSML{name_bar}param file_path="/tmp/a.py" limit="20">',
+         [("read_file", {"file_path": "/tmp/a.py", "limit": "20"})], None),
+        ("a name element with no arguments is not a call",
+         f"prose <{name_bar}DSML{name_bar}name>read_file</{name_bar}DSML{name_bar}name> more prose", None, None),
+        ("the dialect named in prose is not a call",
+         "I'll write it as <|DSML|name>edit</|DSML|name> then the arguments", None, None),
+    ]
+    for label, raw, want, want_clean in name_element_cases:
+        got_calls, cleaned = extract_tool_calls(raw)
+        got = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in (got_calls or [])]
+        if want is None:
+            # No call: the completion is returned untouched, prose and markup alike.
+            ok = got == [] and cleaned == raw
+            expected = "unchanged content, no call"
+        else:
+            clean = cleaned or None
+            ok = got == want and clean == want_clean
+            expected = f"{want!r} cleaned={want_clean!r}"
+        print(f"{'ok  ' if ok else 'FAIL'} name-element {label}: {got} cleaned={cleaned!r}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected}")
+
+    # A tag naming a *field* of the dialect (`name`, `output`) is structural, not a
+    # call. With no declared tool list to refuse it, the guess branch used to read it
+    # as a call named for the field, beside the real call -- a latent duplicate that
+    # only this dialect exposes. The declared-tools path already refused these; these
+    # legs pin the no-declared-tools path.
+    field_tag_cases = [
+        ("a bare name tag is not a call",
+         f"<{name_bar}DSML{name_bar}name>edit</{name_bar}DSML{name_bar}name>"
+         f"<{name_bar}DSML{name_bar}arguments>" '{"file_path": "/a.py"}' "</", ["edit"]),
+        ("a bare output tag is not a call",
+         f"prose <{name_bar}DSML{name_bar}output></{name_bar}DSML{name_bar}output>", None),
+        ("a bare tool_name tag is not a call",
+         f"prose <{name_bar}DSML{name_bar}tool_name>", None),
+    ]
+    for label, raw, want in field_tag_cases:
+        got_calls, _cleaned = extract_tool_calls(raw)
+        got = [c["function"]["name"] for c in (got_calls or [])]
+        ok = got == (want or [])
+        print(f"{'ok  ' if ok else 'FAIL'} field-tag {label}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {want!r}")
+
+    # The streaming hold-back and the scanner must agree on where this dialect begins,
+    # or the marker's text is emitted live and the call arrives doubled.
+    name_marker_at = _find_tool_call_marker(name_pair)
+    ok = name_marker_at == name_pair.index(f"<{name_bar}DSML{name_bar}name>")
+    print(f"{'ok  ' if ok else 'FAIL'} name-element opener is a stream marker: {name_marker_at}")
+    if not ok:
+        failures += 1
+        print(f"     expected: {name_pair.index(f'<{name_bar}DSML{name_bar}name>')}")
+
+    # §19's rule: instrument the success as well as the failure. The raw dump fires
+    # only when a turn fails to parse, so a dialect that parses correctly must leave a
+    # positive trace or a regression to "not read" would be invisible.
+    captured = []
+    original_info = logger.info
+    logger.info = lambda message, *a: captured.append(str(message % a) if a else str(message))
+    try:
+        extract_tool_calls(name_edit)
+    finally:
+        logger.info = original_info
+    traced = any("'name'-element dialect" in m for m in captured)
+    print(f"{'ok  ' if traced else 'FAIL'} name-element parse leaves a positive trace: {captured!r}")
+    if not traced:
+        failures += 1
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -3173,8 +3538,12 @@ def _selftest() -> int:
         + len(round5_cases)
         + len(round6_cases)
         + len(round7_cases)
+        + len(name_element_cases)
+        + len(field_tag_cases)
+        + 2
         + 3
         + 2
+        + 1
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
