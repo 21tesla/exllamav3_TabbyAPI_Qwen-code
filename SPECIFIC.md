@@ -492,12 +492,11 @@ lost by a bounding bug in the caller, not by the glyph loss.
 
 Downstream, the turn did not reach the client as an error. `process_message_tools_and_thinking`
 downgraded `finish_reason` to `stop` and handed over 5 525 characters of prose with
-`<tool_call>` and `{“name”: …` in it. The safety net §2.8 added did its job — no
-`InvalidStreamError`, no abort — but the model's answer was a *description* of a `write_file`
-it never got to perform, as plain text. **§16 corrects the generalisation**: this window is not
-error-free — it carries two `InvalidStreamError` records (client-local 15:10:12 and 15:10:32) —
-and the net reaches one of the client's three abort conditions, not all three. What the net did
-here was let *this* turn end as prose; it does not close the error class. That is the observable end of the session: last
+`<tool_call>` and `{“name”: …` in it. The safety net §2.8 added did its job **in this window** —
+no `InvalidStreamError`, no abort — but the model's answer was a *description* of a `write_file`
+it never got to perform, as plain text. **§16 qualifies what that net reaches**: it answers one of
+the client's three abort conditions, and every abort observed on this checkpoint predates it, so
+this clean window is not evidence that the class is closed. That is the observable end of the session: last
 inference request 19:29:52, no request after it, and nothing but a local `/stats` in the
 transcript.
 
@@ -596,9 +595,14 @@ Two follow-ons worth keeping:
 
 ## 16. The error class the safety net does not close (2026-09-27)
 
-§14.3 says of the `e8ee13a8` glyph-loss turn: "no `InvalidStreamError`, no abort". The
-generalisation is wrong, and it is wrong in the two ways §15 warned about — a filtered count
-and a misread clock. Both were mine.
+§14.3 records the `e8ee13a8` glyph-loss turn as ending without an `InvalidStreamError`. That is
+true of the turn, and **the generalisation from it is not**: this checkpoint produced eleven such
+records, and **nine of them reached the client through this proxy**. What the nine do *not* show
+is a net failing — every one of them predates the version that carries the net, and the two that
+sit in the same session as §14.3 fall four hours before that section's window. The net is real;
+the question is how much of the class it can reach, and the answer is one of the client's three
+abort conditions. Both corrections here are to my own earlier reading: a filtered count and a
+misread clock.
 
 The instrument first: `tabby_watch.py` tested `event.get("event.name") == "api_error"`, but the
 field is namespaced `qwen-code.api_error`. The bare test matched nothing, so **every** api_error
@@ -622,10 +626,17 @@ two exceptions are the first rows below.
 | 2026-09-26 15:10:32 | `e8ee13a8` | 6.0 s | yes — POST 15:10:27 |
 
 Provenance is settled by **request start time**, not by the completion time: each client error
-stamp minus its own `duration_ms` lands on a proxy `POST` within 0.8 s. Both `e8ee13a8` rows are
-in the §14 window, but not at the 23:xx the section names — client-recorded times are EDT, and
-the proxy's own log shows the same minute (15:10:27) as `POST … 200 OK`. The clock was read one
-timezone over.
+stamp minus its own `duration_ms` lands on a proxy `POST` within 0.8 s. The two `e8ee13a8` rows
+are at client-local **15:10**, four hours before §14's stated `19:00→19:30` window, so they are
+**not** in it — §14.3's clean reading of that window stands. They matter because they are the
+latest malformed-call aborts on this checkpoint, 09-25 evening through 09-26 mid-afternoon, and
+the proxy serving them was still older than the net (`a3cff8d`, 09-26 16:09).
+
+The trap is worth naming because it caught me twice in the other direction. A *client* timestamp
+is local and a *transcript* timestamp is UTC; reading an error stamp off one and querying the
+proxy with the other returns an empty window, which looks like evidence of absence rather than a
+wrong hour. The check that settles it is one command: the proxy's last `POST … 200 OK` against the
+transcript's last record reads `23:11:25-04:00` against `03:11:25Z` — four hours, on this box.
 
 **The mechanism, exactly.** The client aborts on three conditions, not one:
 
@@ -648,17 +659,21 @@ malformed call. A proxy that relays deltas — which this one does, deliberately
 not silent for a whole generation (§2) — is structurally downstream of the failure it wants to
 prevent.
 
-**When the net began to work.** Every invocation of "reporting stop …" in the journal falls on
-2026-09-26 after 22:12 — eight of them, plus thirteen `unparsed` warnings from that evening. Not
-one is in the 09-25 19:xx or 09-26 15:10 windows. `git log -S` puts the net's text in `a3cff8d`
-(2026-09-26 16:09). In the 09-25 windows the deployed proxy was `d73f9ec`/`b80c7e9` (09-25
-13:23/13:33), roughly two hours old; at 15:10 it was between `74500ca` (19:16) and `34eb6d5`
-(19:38), still before the net existed.
+**When the net began to work, and what it has been tested against.** `git log -S` puts the net's
+text in `a3cff8d` (2026-09-26 16:09). Every recorded abort on this checkpoint is older than that —
+the latest is the `e8ee13a8` pair at 15:10 — so none of the eleven is a test of the net; they are
+the class as it behaved before the net existed. Every invocation of "reporting stop …" in the
+journal, by contrast, falls on 09-26 ≥ 22:12: eight of them, each turning a `tool_calls`
+completion the proxy could not parse into plain prose. No abort follows any of them, and no
+malformed-tool-call abort occurs anywhere after 16:09, so the net has never faced a streaming-side
+failure at all. That is consistent with it working on the one condition it covers, and says
+nothing about the other two.
 
-So the shape of it: the net is real and it works — it is **not** a general guard against this
-error class, because the client's two streaming-side conditions bypass it entirely. Nine client
-aborts under an old proxy do not test a net built later; the two `e8ee13a8` rows do, and the
-proxy-side log for those same completions shows the parse failing rather than being rescued.
+So the shape of it: the net is real and it works on its own condition. It is **not** a guard
+against the error class, and that is an argument from the client's code rather than from a
+failure — the two conditions it cannot see are settled by the streaming parser, before the
+proxy's end-of-turn correction is even reached. The eleven aborts neither contradict the net nor
+exercise it.
 
 **What this reopens.** §8 and §14.4 claim the downgrade converted "a lost turn into a slow one".
 That holds for a completion the proxy *can* parse as nothing. It does not hold for a completion
