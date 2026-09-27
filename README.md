@@ -166,5 +166,6 @@ qwen --prompt "Solve 5 + 5"     # end-to-end through the proxy
 | [SPECIFIC.md](SPECIFIC.md) | measurements from one real session (`ndlite`, 2026-09-26): the eight invented tool names, where they sit in a batch, and what did *not* fail |
 | `install.sh` | the executable form of both documents |
 | `LD-INSTALL.md` | **this machine only** — absolute paths, the GPU, and a log of the 2026-09-25 repairs. Deliberately git-ignored |
+| `GETTING_1M.md` | **this machine only** — the client-side window bug that reported 1 M cloud models as 200k, and the one-setting fix. Deliberately git-ignored |
 | `tabby-proxy@.service`, `tabby_proxy.py` | the two artifacts that actually ship |
 | `tabby_watch.py` | optional observer: reports only failures on the TabbyAPI path (§12) |

@@ -858,10 +858,24 @@ every field of that list from the entry unconditionally, overwriting the top-lev
 than merging it. The top-level form is only merged on the manual-credentials path. So the provider
 entry is the effective placement, and a top-level `contextWindowSize` is silently ignored.
 
-Getting this wrong is quiet rather than loud: with nothing declared, Qwen Code falls back to
-`tokenLimit(modelId, "input")`, which for a model id it does not recognise — this one included —
-returns a flat **1000000**, not the pack's real **1048576**. `/stats` then reports against the
-wrong denominator. Verify the resolved window from the startup log:
+Getting this wrong is quiet rather than loud, and the fallback is **smaller** than you would guess.
+With nothing declared, Qwen Code resolves the window through `tokenLimit(modelId, "input")` =
+`findTokenLimit()` — a regex table over the *normalised* id — `?? DEFAULT_TOKEN_LIMIT`, and
+`DEFAULT_TOKEN_LIMIT` is **200000**, not 1000000. Two ids land on two different values here, which is
+why they have to be described separately:
+
+* `DeepSeek-V4-Flash-0731-exl3-2.32bpw` **is** recognised. `normalize()` reduces it to
+  `deepseek-v4-flash-0731-exl3-2.32bpw`, which matches `/^deepseek-(?:v4|flash)/` and yields
+  1000000 from the table, so the fallback never applies to it. That value still is not the pack's
+  real 1048576, so the declaration above remains necessary.
+* An id carrying an exotic suffix does **not** match. `normalize()` ends in `s.split(":").pop()`, so
+  `deepseek-v4.1-flash:cloud` collapses to the bare string `cloud`; no pattern matches it and the
+  **200000** fallback wins — a 1 M cloud model reported as a 200k one.
+
+`/stats` then reports against the wrong denominator, and worse, the number feeds compaction:
+`computeThresholds` takes `min(0.85·W, W−33000)` (a 20000 summary reserve plus a 13000 autocompact
+buffer), so a 200000 window auto-compacts at 167000 while 1048576 reaches 891290. Verify the resolved
+window from the startup log:
 
 ```bash
 node ~/.local/lib/qwen-code/lib/cli.js -m DeepSeek-V4-Flash-0731-exl3-2.32bpw -d -p "hi"
@@ -996,6 +1010,9 @@ Each of these actually happened, and each is now handled or documented.
 
 `LD-INSTALL.md` (git-ignored) holds the things that are true only of this machine: absolute paths,
 the GPU, the port layout, and a log of the 2026-09-25 repairs with the states verified after each.
+`GETTING_1M.md` (also git-ignored) records the client-side window bug: why a 1 M model served over an
+Ollama id like `deepseek-v4.1-flash:cloud` reported 200000, and the per-provider `contextWindowSize`
+that fixes it. Read it before changing `~/.qwen/settings.json`.
 
 Three files live outside this repository and are not installed by `install.sh`, so a machine rebuild
 loses them: `~/.local/bin/tabby-reboot-verify.sh`, its
