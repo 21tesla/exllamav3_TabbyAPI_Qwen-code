@@ -905,6 +905,12 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
     content = msg.get("content")
     reasoning = msg.get("reasoning_content")
 
+    # Kept for the diagnostic dump at the foot of this function only: the strip just
+    # below can delete an *entire* completion, and the deleted bytes are precisely
+    # what a `tool_calls` turn needs to show. Everything else reads the stripped
+    # fields, which is what the scanner actually examined.
+    original_content, original_reasoning = content, reasoning
+
     # Both fields are sanitised here as well as inside extract_tool_calls, because
     # this is what lands in `msg`: a repetition loop that yields no call has to be
     # dropped from the answer the client sees, not left in it as raw markup.
@@ -963,12 +969,30 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
         # marker we recognise has to be present -- so gating on one made the family
         # that most needs the bytes the one that could not capture them. Measured
         # 2026-09-26 (session 6ce029e1): a first turn announced a call, parsed to
-        # nothing, and this dump stayed silent on the marker test alone. `content`
-        # is preferred; `reasoning` is the true fallback because the ` thinking`
-        # branch above writes `msg["content"]` as the *post*-think tail, so the
-        # field the parser actually examined is the reasoning one.
-        if _RAW_LOG and raw and (marked or choice.get("finish_reason") == "tool_calls"):
-            logger.warning(f"Raw unparsed completion: {raw[:_RAW_MAX]!r}")
+        # nothing, and this dump stayed silent on the marker test alone. The dump
+        # below covers both fields the parser examined, not just the first non-empty
+        # one: the ` thinking` branch above writes `msg["content"]` as the
+        # *post*-think tail, so the text the scanner was handed and the field that
+        # held the call need not be the same one.
+        if _RAW_LOG and (marked or choice.get("finish_reason") == "tool_calls"):
+            # Dump **both** fields, because the parser tried both: a completion whose
+            # text field is clean prose can still carry the failed call in
+            # `reasoning_content`, and dumping only the first non-empty field hid
+            # exactly that case the moment this gate moved here (observed
+            # 2026-09-26, session aba2e4e2: the dump stopped at the bare
+            # announcement, three newlines and nothing else). Where the repetition
+            # strip changed a field, the *emitted* text is dumped as well -- that
+            # strip can delete a whole completion, and a `tool_calls` turn that
+            # stripped to nothing is otherwise invisible.
+            for field, shown, emitted in (
+                ("completion", content, original_content),
+                ("reasoning", reasoning, original_reasoning),
+            ):
+                if not emitted:
+                    continue
+                logger.warning(f"Raw unparsed {field}: {(shown or '')[:_RAW_MAX]!r}")
+                if shown != emitted:
+                    logger.warning(f"Raw unparsed {field} before the repetition strip: {emitted[:_RAW_MAX]!r}")
         # `tool_calls` with nothing in it is the one pair Qwen Code treats as a
         # malformed call and aborts the turn on: the client sees a finish reason
         # it cannot act on and stops the session. If the marker could not be
@@ -1797,6 +1821,44 @@ def _selftest() -> int:
         if not ok:
             failures += 1
             print(f"     expected dumped={want_dump and _RAW_LOG}, warnings={captured!r}")
+
+    # The dump covers both fields the parser examined, not just the first non-empty
+    # one. Observed live 2026-09-26 (session aba2e4e2): the text field was the bare
+    # announcement *"I'll start by reading the stage brief."* and the dump stopped
+    # there, so whether the failed call sat in `reasoning_content` went unrecorded.
+    two_field_msg = {
+        "content": "Let me read the brief now.",
+        "reasoning_content": "Prose.\n<tool_call>\nthis is not json\n</tool_call>",
+    }
+    captured = []
+    original_warning = logger.warning
+    logger.warning = lambda message, *a, **k: captured.append(str(message))
+    try:
+        process_message_tools_and_thinking(dict(two_field_msg), {"finish_reason": "tool_calls"}, None)
+    finally:
+        logger.warning = original_warning
+    got_fields = [m.split(":", 1)[0] for m in captured if "Raw unparsed" in m]
+    both_fields = (not _RAW_LOG) or ("Raw unparsed reasoning" in got_fields and "Raw unparsed completion" in got_fields)
+    print(f"{'ok  ' if both_fields else 'FAIL'} rawdump covers the reasoning field too: {got_fields}")
+    if not both_fields:
+        failures += 1
+
+    # A `tool_calls` turn the repetition strip emptied is the other half of that
+    # blind spot: the loop is deleted before the dump sees it, so the emitted text
+    # has to be dumped as well or the turn leaves no evidence at all.
+    loop_only = {"content": "<tool_call>" * 5, "reasoning_content": None}
+    captured = []
+    original_warning = logger.warning
+    logger.warning = lambda message, *a, **k: captured.append(str(message))
+    try:
+        process_message_tools_and_thinking(dict(loop_only), {"finish_reason": "tool_calls"}, None)
+    finally:
+        logger.warning = original_warning
+    prestrip = [m for m in captured if "before the repetition strip" in m]
+    strip_ok = (not _RAW_LOG) or bool(prestrip)
+    print(f"{'ok  ' if strip_ok else 'FAIL'} rawdump shows a stripped-away completion: {len(prestrip)} line(s)")
+    if not strip_ok:
+        failures += 1
 
     # A completion past roughly 180k tokens loses ASCII: `"` becomes `“`/`”` and `|`
     # becomes the fullwidth `｜`. Neither reads as a quote or a bar to Python, so a

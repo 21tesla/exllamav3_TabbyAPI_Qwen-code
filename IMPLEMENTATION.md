@@ -251,16 +251,35 @@ probe): the model announced a call, the proxy parsed nothing, the dump stayed si
 decoded `no call was parsed` line was recorded. The gate is now the finish reason:
 
 ```python
-if _RAW_LOG and raw and (marked or choice.get("finish_reason") == "tool_calls"):
-    logger.warning(f"Raw unparsed completion: {raw[:_RAW_MAX]!r}")
+if _RAW_LOG and (marked or choice.get("finish_reason") == "tool_calls"):
+    for field, shown, emitted in (
+        ("completion", content, original_content),
+        ("reasoning", reasoning, original_reasoning),
+    ):
+        if not emitted:
+            continue
+        logger.warning(f"Raw unparsed {field}: {(shown or '')[:_RAW_MAX]!r}")
+        if shown != emitted:
+            logger.warning(f"Raw unparsed {field} before the repetition strip: {emitted[:_RAW_MAX]!r}")
 ```
 
-The decoded one-liner still requires the marker, which is what it is for. Four self-test legs cover
-the rule: a markerless unparsed call dumps, a clean `stop` does not, an empty completion does not
-dump an empty string, and a marked-but-unparseable wrapper still does. The dump sits in
-`process_message_tools_and_thinking`, which **both** the buffered and the streaming path route
-through, so one gate covers the two `no call was parsed` branches (the buffered one here, and the
-streaming guard that follows).
+Three details are load-bearing, each from a case observed the same evening. **Both fields are
+dumped**, because the parser tried both: on session `aba2e4e2` the text field was the bare
+announcement (`"I'll start by reading the stage brief.\n\n\n"`) and dumping only the first non-empty
+field stopped there, leaving unrecorded whether the failed call sat in `reasoning_content`. **The
+pre-strip text is dumped too**, because `_strip_repetition_tail` runs at the top of the function and
+can delete an *entire* completion — the same session's first attempt produced `Upstream produced an
+empty completion` at 45 output tokens, and the loop that was removed is the only evidence that turn
+could have left. And the decoded one-liner still requires the marker, which is what it is for. Six
+self-test legs cover the rule; the dump sits in `process_message_tools_and_thinking`, which **both**
+the buffered and the streaming path route through, so one gate covers the two `no call was parsed`
+branches (the buffered one here, and the streaming guard that follows).
+
+A note on what the dump *cannot* say: the streaming accumulator reads `delta.content` and
+`delta.reasoning_content` only — a native OpenAI-style `delta.tool_calls` is not accumulated. So if
+a future `Raw unparsed completion`/`reasoning` pair shows clean prose in both fields while the
+upstream declared `tool_calls`, the call did not arrive as text at all, and that is the question to
+settle next rather than a parse failure to chase.
 
 **A hoisted parameter is folded back in.** `normalize_tool_call_dict` used to take `arguments`
 verbatim whenever it was present, silently dropping a parameter the model left beside it:
