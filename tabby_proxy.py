@@ -954,10 +954,21 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
 
     if not extracted_calls:
         raw = content or reasoning or ""
-        if "DSML" in raw or "<tool_call" in raw or "\\uff5c" in raw:
+        marked = "DSML" in raw or "<tool_call" in raw or "\\uff5c" in raw
+        if marked:
             logger.warning(f"Tool-call syntax present but unparsed: {raw[:300]!r}")
-            if _RAW_LOG:
-                logger.warning(f"Raw unparsed completion: {raw[:_RAW_MAX]!r}")
+        # The raw dump is deliberately NOT gated on `marked`. A completion that
+        # carried a `tool_calls` finish reason and yielded no call is precisely the
+        # case the wire bytes are wanted for, and it is also the case where *no*
+        # marker we recognise has to be present -- so gating on one made the family
+        # that most needs the bytes the one that could not capture them. Measured
+        # 2026-09-26 (session 6ce029e1): a first turn announced a call, parsed to
+        # nothing, and this dump stayed silent on the marker test alone. `content`
+        # is preferred; `reasoning` is the true fallback because the ` thinking`
+        # branch above writes `msg["content"]` as the *post*-think tail, so the
+        # field the parser actually examined is the reasoning one.
+        if _RAW_LOG and raw and (marked or choice.get("finish_reason") == "tool_calls"):
+            logger.warning(f"Raw unparsed completion: {raw[:_RAW_MAX]!r}")
         # `tool_calls` with nothing in it is the one pair Qwen Code treats as a
         # malformed call and aborts the turn on: the client sees a finish reason
         # it cannot act on and stops the session. If the marker could not be
@@ -1743,6 +1754,49 @@ def _selftest() -> int:
         if not ok:
             failures += 1
             print(f"     expected: {expected!r}")
+
+    # The `no call was parsed` family, added 2026-09-26 after session 6ce029e1: the
+    # first turn of that probe announced a call, the upstream set `tool_calls`, and
+    # the proxy parsed nothing -- yet the raw dump stayed silent, because it was
+    # gated on a recognised marker and this completion carried none. The dump must
+    # follow the finish reason instead. The three legs below are the whole rule:
+    # a markerless unparsed call dumps, an unmarked *clean* stop does not, and a
+    # genuinely empty completion does not dump an empty string.
+    dump_cases = [
+        ("markerless unparsed call dumps raw", {"finish_reason": "tool_calls"}, "markerless", True),
+        ("a clean stop dumps nothing", {"finish_reason": "stop"}, "markerless", False),
+        ("an empty completion dumps nothing", {"finish_reason": "tool_calls"}, "", False),
+        ("a marked unparsed call still dumps", {"finish_reason": "tool_calls"}, "marker", True),
+    ]
+    for name, scenario, content_kind, want_dump in dump_cases:
+        if content_kind == "marker":
+            # A marker the parser recognises but cannot turn into a call -- the
+            # `marked` half of the rule. (A truncated-JSON wrapper would *not* do:
+            # the scanner salvages a call from it, so it never reaches this branch.)
+            payload = "Prose before.\n<tool_call>\nthis is not json\n</tool_call>"
+        elif content_kind == "":
+            payload = ""
+        else:
+            payload = "Let me read the brief now."
+        msg = {"content": payload, "reasoning_content": None}
+        choice = {"finish_reason": scenario["finish_reason"]}
+        captured: List[str] = []
+        original_warning = logger.warning
+        logger.warning = lambda message, *a, **k: captured.append(str(message))
+        try:
+            process_message_tools_and_thinking(msg, choice, None)
+        finally:
+            logger.warning = original_warning
+        dumped = any("Raw unparsed completion" in message for message in captured)
+        # The dump follows the flag, so the expectation has to as well: this file is
+        # run both from the unit (where `~/.config/tabby-proxy.env` arms the flag)
+        # and by hand from a shell (where it is off), the same way the raw-dump leg
+        # above compares against `_RAW_LOG` rather than against a literal.
+        ok = dumped == (want_dump and _RAW_LOG)
+        print(f"{'ok  ' if ok else 'FAIL'} rawdump {name}: dumped={dumped} (flag={_RAW_LOG})")
+        if not ok:
+            failures += 1
+            print(f"     expected dumped={want_dump and _RAW_LOG}, warnings={captured!r}")
 
     # A completion past roughly 180k tokens loses ASCII: `"` becomes `“`/`”` and `|`
     # becomes the fullwidth `｜`. Neither reads as a quote or a bar to Python, so a

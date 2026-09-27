@@ -219,7 +219,7 @@ Optional verbose capture, off by default because raw completion text is untruste
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `TABBY_PROXY_RAW_LOG` | off | With `1`/`true`/`yes`/`on`, append the raw payload to each shape warning and to the existing "tool-call syntax present but unparsed" warning. **Armed on this machine** for the next probe; see below. |
+| `TABBY_PROXY_RAW_LOG` | off | With `1`/`true`/`yes`/`on`, append the raw payload to each shape warning, to the existing "tool-call syntax present but unparsed" warning, and (since 2026-09-26) to *any* completion that arrived with a `tool_calls` finish reason and yielded no call. **Armed on this machine** for the next probe; see below. |
 | `TABBY_PROXY_RAW_LOG_CHARS` | `20000` | Cap on characters dumped per warning, so one pathological completion cannot flood the journal. |
 
 It is read once at import, so turning it on or off needs a restart — the flag cannot be toggled on a
@@ -241,6 +241,26 @@ With `TABBY_PROXY_RAW_LOG=1` the occurrence above is distinguishable: whether `f
 before `arguments` (model hoisted the parameter) or not at all (model omitted it). That is the
 question the name-only logging could not answer — and the first of those two shapes is now
 *recovered* rather than merely reported; see below.
+
+**The dump no longer requires a recognised marker, and that was a real blind spot.** The unparsed
+dump used to sit inside the same `if` as the decoded "syntax present but unparsed" line — so it
+fired only when the completion contained `DSML`, `<tool_call>` or `\uff5c`. But the family that most
+needs the wire bytes is the *markerless* one: a completion the upstream declared `tool_calls` that
+yields no call at all. Measured on 2026-09-26 (session `6ce029e1`, the first turn of the stage-141
+probe): the model announced a call, the proxy parsed nothing, the dump stayed silent, and only the
+decoded `no call was parsed` line was recorded. The gate is now the finish reason:
+
+```python
+if _RAW_LOG and raw and (marked or choice.get("finish_reason") == "tool_calls"):
+    logger.warning(f"Raw unparsed completion: {raw[:_RAW_MAX]!r}")
+```
+
+The decoded one-liner still requires the marker, which is what it is for. Four self-test legs cover
+the rule: a markerless unparsed call dumps, a clean `stop` does not, an empty completion does not
+dump an empty string, and a marked-but-unparseable wrapper still does. The dump sits in
+`process_message_tools_and_thinking`, which **both** the buffered and the streaming path route
+through, so one gate covers the two `no call was parsed` branches (the buffered one here, and the
+streaming guard that follows).
 
 **A hoisted parameter is folded back in.** `normalize_tool_call_dict` used to take `arguments`
 verbatim whenever it was present, silently dropping a parameter the model left beside it:
