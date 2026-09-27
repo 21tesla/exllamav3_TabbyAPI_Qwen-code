@@ -1,3 +1,4 @@
+import ast
 import os
 import re
 import json
@@ -61,7 +62,15 @@ _DSML_WORD = re.compile(r"DSML", re.IGNORECASE)
 _DSML_ESCAPED_BAR = re.compile(r"(?i)\\uff5c")
 _DSML_ESCAPED_UNDERSCORE = re.compile(r"(?i)\\u2581")
 _TAG_RE = re.compile(r"<[^<>]{0,200}>")
-_ATTR_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*[\"\x27]([^\"\x27]*)[\"\x27]")
+# An attribute value, in any of the three spellings this checkpoint uses:
+#   key="value"   key='value'   key={...}
+# The quoted arms are mutually exclusive on purpose. The value class must admit one
+# quote and consume up to its *matching* one, because the `call_tool` dialect wraps
+# an object in double quotes around Python-style single-quoted keys
+# (`args="{'pattern': '...'}"`) -- the old single class, `[^"\x27]*`, stopped at the
+# first inner quote and captured `{` alone, so the whole argument object was lost
+# and the call went out as `{}` (captured live 2026-09-26, session e5e8c7f9).
+_ATTR_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|(\{[^{}]*\}))")
 # An attribute whose value is a brace object rather than a quoted string, e.g.
 # `args={"file_path": "/x"}`. The braces balance one level; a nested object inside
 # would end the match early, which the caller's JSON repair then covers.
@@ -190,7 +199,7 @@ def split_dsml_tag(tag: str) -> Tuple[str, bool, Dict[str, str], bool]:
     is_closing = body.startswith("/")
     if is_closing:
         body = body[1:].strip()
-    attrs = {k.lower(): v for k, v in _ATTR_RE.findall(body)}
+    attrs = {k.lower(): (dq or sq or obj) for k, dq, sq, obj in _ATTR_RE.findall(body)}
     # An attribute whose value is a brace object is not quoted, so the regex above
     # skips it -- and that is exactly how the `call_tool` dialect carries its
     # arguments (`args={...}`). Capture the balanced braces separately; the nested
@@ -358,7 +367,16 @@ def _parse_attr_arguments(value: str) -> Dict[str, Any]:
             parsed = repair_truncated_json(candidate)
         if isinstance(parsed, dict):
             return parsed
-    return {}
+    # A Python *literal* dict is not JSON (`{'a': 1}`), and this checkpoint writes
+    # one whenever it wraps an argument object in quotes -- the `call_tool` dialect
+    # does exactly that (`args="{'pattern': '...'}"`). `literal_eval` reads it, and
+    # is safe here: it evaluates literals only, never a call. It is a fallback, so
+    # a value that is already valid JSON keeps the reading it has always had.
+    try:
+        parsed = ast.literal_eval(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def parse_dsml_tool_calls(
@@ -796,6 +814,20 @@ def repair_truncated_json(text: str) -> Optional[Any]:
                 if not remaining:
                     break
                 remaining.pop()
+    # JSON rejects an escape it does not define, and this checkpoint emits `\.` and
+    # `\(` inside a regex argument (`"\.index\("`). Python's own literal syntax
+    # accepts both, so a call whose only defect is such an escape reads as a Python
+    # literal and not as JSON -- the block was lost outright, taking its sibling's
+    # recovery with it (captured live 2026-09-26, session e5e8c7f9). `literal_eval`
+    # evaluates literals only, and a value JSON already accepted never reaches this
+    # fallback, so the JSON reading always wins.
+    for cut in cuts:
+        try:
+            obj = ast.literal_eval(text[:cut])
+        except Exception:
+            continue
+        if isinstance(obj, (dict, list)):
+            return obj
     return None
 
 
@@ -2581,6 +2613,39 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
+    # The `call_tool` dialect, wrapped in quotes and written as Python. Two defects
+    # met in one payload (captured live 2026-09-26, session e5e8c7f9): the attribute
+    # regex stopped at the first inner quote and captured `{` alone, and the value it
+    # did capture was a Python literal dict that `json.loads` cannot read. The first
+    # case is that payload in miniature -- one call whose arguments are lost without
+    # both fixes. The second is the same failure reaching the JSON pass: `\.index\(`
+    # is an escape JSON rejects and Python accepts, and losing that block also cost
+    # the sibling inside it.
+    round7_cases = [
+        ("a quoted Python-repr object attribute is read",
+         f'<{fw}DSML{fw}skill name="grep_search" '
+         "args=\"{'pattern': '_LABELS_HEAD|HEADERS', 'path': '/tmp/x.py'}\"/>",
+         [("grep_search", {"pattern": "_LABELS_HEAD|HEADERS", "path": "/tmp/x.py"})]),
+        ("an invalid escape is read as a Python literal",
+         '<tool_call>\n{"name": "grep_search", "arguments": '
+         '{"pattern": "Delta|\\.index\\(", "path": "/tmp/t.py"}}\n</tool_call>',
+         [("grep_search", {"pattern": "Delta|\\.index\\(", "path": "/tmp/t.py"})]),
+        ("a JSON object still wins over the literal reading",
+         '<tool_call>\n{"name": "read_file", "arguments": {"file_path": "/tmp/z.py"}}\n</tool_call>',
+         [("read_file", {"file_path": "/tmp/z.py"})]),
+    ]
+    for label, raw, expected in round7_cases:
+        calls, _cleaned = extract_tool_calls(raw)
+        try:
+            got = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in (calls or [])]
+        except Exception as exc:
+            got = f"unparseable: {exc}"
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} round7 {label}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -2602,6 +2667,7 @@ def _selftest() -> int:
         + len(guard_cases)
         + len(round5_cases)
         + len(round6_cases)
+        + len(round7_cases)
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
