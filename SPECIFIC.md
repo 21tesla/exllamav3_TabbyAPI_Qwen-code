@@ -547,3 +547,47 @@ one.
 4. **The repetition stripper's `unparsed` gap** — nine openers with no closers mid-completion is
    not a tail run. Cheap to check whether a mid-text run should be collapsed too.
 
+## 15. A third probe, and the one error the observer caused (2026-09-26 22:42 EDT →)
+
+A third session, `e5e8c7f9` (`analysis-qt6-c7`), ran the same evening as §14 at a **lower** context
+(133 k–139 k tokens), against an earlier fix set plus the four that followed it — the native
+`delta.tool_calls` merge, the `call_tool` attribute dialect, the declared-name guard, and the
+`call` per-argument attributes. Those defects and their fixes are recorded in the commits, not
+here: this section exists for one thing only, because it is not a finding about the model.
+
+**The session's only `api_error` is the observer's own.**
+
+```
+03:08:22 (UTC)  TypeError:UND_ERR_SOCKET  terminated (cause: UND_ERR_SOCKET: other side closed)
+```
+
+| time (EDT) | event |
+|---|---|
+| 23:06:51 | the client's request reaches the proxy and upstream generation begins |
+| 23:06:52 | the observer runs `systemctl --user restart tabby-proxy@home-logan.service` |
+| 23:06:52–23:08:22 | uvicorn waits, trying to drain the in-flight generation |
+| 23:08:22 | `TimeoutStopUSec` (90 s, the default for this unit) expires: `State 'stop-sigterm' timed out. Killing.` → SIGKILL → the client's socket closes |
+
+The proxy cannot drain a generation of that length (the turn before it had taken 154 s), so a
+restart during one kills it, and the client records the closed socket as an `api_error`. The probe
+retried, the retry landed, and the next served turn was clean — the cost was one turn. Left
+unlabelled, though, that row reads as model behaviour in the same transcript the model is being
+studied in, which is exactly the kind of contamination this document exists to prevent.
+
+**The mistake was the precondition, not the restart.** An idle *client* was checked and an idle
+*proxy* was not. The proxy holds an accepted connection for the whole generation, so the signal is
+`ss -tnp | grep 8081` showing an `ESTAB` pair (`node` ↔ `python`), or the journal's last line not
+being a request in progress. The transcript's mtime only proves the client is between turns, which
+is a different question.
+
+Two follow-ons worth keeping:
+
+1. **A deliberate restart is still the right way to get a parser fix onto the wire** — but it must
+   be timed to an idle proxy, and a cut made anyway has to be annotated rather than assumed clean.
+   `systemctl restart` gives no way to bound the drain; stopping, waiting for the connection to
+   clear on its own, and starting is the graceful form.
+2. **A filter can hide the very error being counted.** The first read of this session reported "0
+   `api_error`" for the whole run; the field is `event.name == "qwen-code.api_error"`, and matching
+   the bare substring `"api_error"` matched nothing. The count was 1 from the moment it happened.
+   Count on the parsed field, not on a substring of its name.
+
