@@ -61,7 +61,16 @@ _DSML_BARS = re.compile(r"[|\uff5c]")
 _DSML_WORD = re.compile(r"DSML", re.IGNORECASE)
 _DSML_ESCAPED_BAR = re.compile(r"(?i)\\uff5c")
 _DSML_ESCAPED_UNDERSCORE = re.compile(r"(?i)\\u2581")
-_TAG_RE = re.compile(r"<[^<>]{0,200}>")
+# A single tag's body. The cap exists so a stray `<` in prose cannot run to a much
+# later `>` and swallow the text between, but 200 was too small for a *real* call: the
+# `skill` dialect rides its whole argument object on the tag
+# (`<|DSML|skill name="grep_search" args="{'pattern': '...'}" />`), so the tag's length
+# grows with the pattern the model chose. The round-7 payload's `_skill` tag measures
+# 253 characters, and the 202-char ceiling skipped it whole -- losing the one call that
+# dialect was written to read (captured live 2026-09-26, session e5e8c7f9). The bound
+# is kept, not removed: it is what stops prose from being scanned as one long tag.
+_TAG_BODY_MAX = 1000
+_TAG_RE = re.compile(r"<[^<>]{0,%d}>" % _TAG_BODY_MAX)
 # An attribute value, in any of the three spellings this checkpoint uses:
 #   key="value"   key='value'   key={...}
 # The quoted arms are mutually exclusive on purpose. The value class must admit one
@@ -2621,6 +2630,15 @@ def _selftest() -> int:
     # both fixes. The second is the same failure reaching the JSON pass: `\.index\(`
     # is an escape JSON rejects and Python accepts, and losing that block also cost
     # the sibling inside it.
+    # A pattern long enough that the tag carrying it clears the old 202-char body
+    # cap. Round 7's fixture used a short one, so it passed on the old `_TAG_RE`
+    # too and proved nothing about length; the real tag measured 253 characters and
+    # was skipped whole.
+    _long_pattern = (
+        "molecule_menu|add_sequence_act|_open_add_sequence_dialog|_menus_by_title"
+        "|_place_top_menus|top_menus|_window_menu|_file_menu|_protocol_menu"
+        "|_molecule_menu|_view_menu|_window_menu_build"
+    )
     round7_cases = [
         ("a quoted Python-repr object attribute is read",
          f'<{fw}DSML{fw}skill name="grep_search" '
@@ -2633,6 +2651,10 @@ def _selftest() -> int:
         ("a JSON object still wins over the literal reading",
          '<tool_call>\n{"name": "read_file", "arguments": {"file_path": "/tmp/z.py"}}\n</tool_call>',
          [("read_file", {"file_path": "/tmp/z.py"})]),
+        ("a call whose tag outgrows the old body cap is still read",
+         f"<{fw}DSML{fw}skill name=\"grep_search\" "
+         f"args=\"{{'pattern': '{_long_pattern}', 'path': '/tmp/long.py'}}\"/>",
+         [("grep_search", {"pattern": _long_pattern, "path": "/tmp/long.py"})]),
     ]
     for label, raw, expected in round7_cases:
         calls, _cleaned = extract_tool_calls(raw)

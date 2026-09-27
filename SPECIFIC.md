@@ -734,18 +734,18 @@ resort; JSON still wins whenever it can read the text.
 
 | reading | calls recovered |
 |---|---|
-| as shipped | **2**, one with `{}` arguments |
-| both attribute fixes | 3 |
-| plus the literal fallback for escapes | **4** |
+| as shipped (the journal's own count) | **2**, one with `{}` arguments |
+| all three fixes above | **4** |
+| and the tag body no longer capped short (§18) | **5** |
 
-All four well-formed calls are `grep_search` with `pattern` and `path` intact, the `\.` preserved.
-The payload *intended* five; the last `_skill` tag was truncated by the model itself mid-argument
-(`args="{\'columnCount|…` with no closer), and a truncated tag is not recoverable from the text.
-That one is the model's, not the reader's — the first loss of the round that is.
+The payload contains **five** `grep_search` calls and every one is recoverable from the text: three
+ride `_skill` tags and two are plain JSON `<tool_call>` blocks. All five keep `pattern` and `path`
+intact, the `\.` preserved. §17 first recorded the fifth as the *model's* loss — a truncated tag —
+and that was wrong; §18 replays the bytes and corrects it.
 
 The three fixes ship together (`06ae605`) with three new `round7` self-test cases — one per defect,
 and one asserting that a JSON object still wins over the literal reading — taking the suite from
-90 to **93 cases**. The same payload replays 2 → 4.
+90 to **93 cases**. On the captured payload they take 2 → 4; the fifth needs §18.
 
 **Two more undeclared names, and what the guard is for.** The same evening produced `Dropped
 non-call DSML tag 'nest'` (23:20:49) and `'arice'` (23:23:12) — the round-4 guard catching two
@@ -753,4 +753,76 @@ more invented wrappers, both harmless because the calls inside them were read fr
 bodies. Every undeclared name this checkpoint has produced is an envelope or a fragment of one,
 never a tool the model wished existed; that is the whole reason the guard refuses the tag rather
 than the call.
+
+## 18. The tag-length cap that silently ate a call, and the test that could not see it (2026-09-27 00:30)
+
+Round 7 was written for the payload quoted in §17 and it fixed the two defects named there. The
+payload carries **five** `grep_search` calls, and after round 7 the build recovered **four**. The
+fifth was written off as the model's own loss — a `_skill` tag truncated mid-argument, its
+arguments unreadable. That was wrong, and re-reading the captured bytes says so: **every `_skill`
+tag in the payload is complete**, its `args="…"/` closed. The call was lost in the *reader*, not
+in the model.
+
+What lost it is the scanner's tag regex, not any of the three defects §17 names:
+
+```
+_TAG_RE = re.compile(r"<[^<>]{0,200}>")
+```
+
+A single tag's body was capped at 200 characters. The cap is there for a reason — without a
+bound, a stray `<` in prose runs to a much later `>` and swallows the text between — but the
+`_skill` dialect is exactly the shape that outgrows it, because it carries its whole argument
+object on the tag. The lengths in this one payload, measured rather than guessed:
+
+| tag | body length | matched by the 202-char ceiling? |
+|---|---|---|
+| `_skill` carrying `molecule_menu\|…` | 253 | **no** |
+| `_skill` carrying `_LABELS_HEAD\|_LABEL_\|…` | 191 | yes |
+| `_skill` carrying `Delta\|Shift\|…` | 168 | yes |
+
+So the longest tag — the one whose pattern simply ran longer — was skipped whole, and the call
+with it. The other two `_skill` calls were read, which is why the failure looked like "four of
+five" rather than a dialect the reader never learned.
+
+`_TAG_BODY_MAX` is now 1000, still a bound. The bound is a real protection; the *number* was the
+bug.
+
+**Why the round-7 test could not have caught it.** The test written for that dialect used a
+*short* pattern:
+
+```
+args="{'pattern': '_LABELS_HEAD|HEADERS', 'path': '/tmp/x.py'}"
+```
+
+Its tag is a fraction of 200 characters, so it passed on the old `_TAG_RE` exactly as it passes on
+the new one — it tested the *quoting* defect and never touched the length. A fixture that passes
+on both the broken and the fixed reader proves nothing about the fix; the regression case added
+here uses a pattern long enough that the tag clears 200 (`molecule_menu|add_sequence_act|…`), and
+it fails on the old cap with **0 calls** and passes on the new one.
+
+The lesson is the one §16 already taught in another guise: the instrument's own limit reads as a
+clean result. A parser that skips a tag too long for its regex reports a *smaller* call count, not
+an error, and a test whose fixture never reaches the limit reports success. Both say nothing.
+
+| reading | calls recovered from the §17 payload |
+|---|---|
+| round 3, as first shipped | 2 (one `{}`) |
+| round 7 (`06ae605`) | 4 |
+| plus `_TAG_BODY_MAX` | **5 of 5** |
+
+**The client's side of the same class, counted.** The empty-argument call is not only a proxy
+warning; it is a tool result the client refuses. Over this one session the client rejected **eight**
+calls with `params must have required property '…'`, and every one of them carried `args: {}` —
+`read_file` ×4, `glob` ×3, `grep_search` ×1, i.e. an empty-argument call is not specific to one
+tool. The proxy warned on **seven** of them (six `read_file`, one `grep_search`); the three `glob`
+have no matching warning, because they arrived over the upstream *native* `tool_calls` channel and
+its rows are the ones the journal records as "Upstream said tool_calls but no call was parsed;
+reporting stop" (22:43:33 and 22:43:38) rather than as a shape warning. One of the seven is
+confirmed as one call by id: the proxy's `grep_search`/`['pattern']` warning at `23:16:50.946`
+and the client's `call_8baf2ff1 grep_search {}` at `03:16:50.959Z` (UTC), whose result at
+`03:16:51.000Z` reads `params must have required property 'pattern'`.
+
+**No recurrence.** Since the round-7 deploy at `23:23:12`, `missing required parameter` in the
+journal is **0**. The empty-argument class as recorded here is pre-deploy; whether it is closed
+outright is what the probe's next turns test.
 
