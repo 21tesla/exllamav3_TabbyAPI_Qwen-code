@@ -256,6 +256,11 @@ Also benign, recorded so they are not re-diagnosed as faults:
   differing files, and a `grep -q`. Both exit 1 *because* the command did its job. `classify()`
   only exempts `status == "cancelled"`, so this class is reported; see §10.
 
+Two more of this class were pinned later, at 185k context, and are the first to be traced to a
+specific argument *value* rather than a call shape: a `grep_search` naming a file that does not
+exist, and an `edit` whose `old_string` conjoined two real but non-adjacent lines. §20 records the
+measurement and the in-batch control that rules out a transport cause.
+
 ## 9. Revisit checklist — worked 2026-09-26
 
 1. ~~Re-run the §2 aggregates on the final transcript.~~ **Done.** 418 records, 33 turns, 150 calls;
@@ -826,6 +831,10 @@ and the client's `call_8baf2ff1 grep_search {}` at `03:16:50.959Z` (UTC), whose 
 journal is **0**. The empty-argument class as recorded here is pre-deploy; whether it is closed
 outright is what the probe's next turns test.
 
+The "eight" counted above is the **empty-argument** sub-kind only, and it is pre-deploy. The
+session's later refusals — the `invalid_tool_params` of §20 — carry populated arguments and are a
+different sub-kind, caught by the executor rather than the proxy.
+
 ## 19. Watching a parser that fails silently (2026-09-27 00:35)
 
 §18's loss went unnoticed not because it was hard to see but because *nothing was watching for it*.
@@ -873,4 +882,71 @@ All three are covered by self-test cases (97 total), because a guard no one can 
 better than no guard. The principle this section records: **on a mission-critical path, instrument
 the success as well as the failure** — the failure log is empty in both the good case and the
 invisible-loss case, and only the positive trace tells them apart.
+
+## 20. Two content errors at the argument layer, with the control that rules transport out (2026-09-27 03:45–03:47)
+
+Two client refusals landed within two minutes of each other, at and just past 185k tokens — inside
+the band where the glyph regime is documented to start (`tabby_proxy.py:141`, "past roughly 180k";
+captured case at 195k). On the monitor line alone, both fit the mangled-glyph family §16 predicts.
+Measurement says neither is that family. They are §8's class — errors in the model's *task* work,
+not in the call framing — and they are the first two of that class to be pinned to an argument
+*value* rather than a call shape.
+
+| time (UTC) | call | tool | refusal | what the arguments had done |
+|---|---|---|---|---|
+| 03:45:08 | `call_65ed04d7` | `grep_search` | `invalid_tool_params: Path does not exist: …/project_io_foundation.py` | named a file that is not on disk |
+| 03:46:46 | `call_7a07baf1` | `edit` | `edit_no_occurrence_found` in `tests/test_assign_panel.py` | quoted two real lines as if adjacent |
+
+**What the model did, exactly.** The `grep_search` path `project_io_foundation.py` matches no file:
+the model welded two real names, `project_io.py` and `foundation.py`, into one. The `edit`
+`old_string` is 137 characters, pure ASCII, and spells out two assertions that both exist — but at
+lines 370 and 382, twelve lines apart. The model's own next turn confirms it believed they were
+consecutive: *"I need to see the exact text at line 370-382 that failed to edit."* It did not
+mis-transcribe either line; it mis-assembled the span.
+
+**The proxy is exonerated by its own instrument, not by assumption.** The journal around each turn
+shows clean parsing and zero warnings:
+
+```
+23:45:08,294  Intercepted and parsed 3 tool call(s) from content: ['grep_search', 'grep_search', 'glob']
+23:46:46,821  Intercepted and parsed 2 tool call(s) from content: ['edit', 'edit']
+```
+
+No raw dump fired on either turn (the dump is armed and triggers only when parsing fails), and no
+`missing required parameter`, shape, or dropped-tag warning appears in the window. Both calls
+reached the client fully formed; the refusal happened *after* the proxy was out of the path.
+
+**The control that rules transport out.** The refused turn carried two `edit` calls in one response.
+The refused one (`call_7a07baf1`) had a 137-char, **pure-ASCII** `old_string`. Its sibling
+(`call_18e295da`) had a 302-char `old_string` carrying three non-ASCII code points (U+00A7 `§`,
+U+2192 `→`, U+2212 `−`) and a 356-char `new_string` carrying four — and it **applied cleanly**,
+which is the hunk now visible in `tests/test_assign_panel.py` at line 335. If transport were
+mangling bytes at this context length, the longer, non-ASCII-bearing sibling is the call that
+should have failed. It did not. The failed argument's bytes were never at risk.
+
+**Both were recovered in-batch, which is the real mitigation.** The `grep_search` ran beside a
+`glob {"pattern": "src/analysis_qt6/state/project_io*.py"}` that returned OK — the model reaching
+for the file it had lost. The `edit` ran beside `call_18e295da`, which applied. In neither case did
+a content error require a retry loop; the parallel call covered it, exactly as §6 predicts for
+errors that sit at position 0 of a widened batch.
+
+**Where this leaves the glyph-regime watch.** The prediction was that the first turn past 180k
+would expose the mangled-glyph class. The first two turns past 185k did not: the only non-ASCII in
+either the calls or the refusals is the model's own legitimate `§`/`→`/`−` from the analysis-qt6
+annotation style. The regime has not arrived at 185k in this session, and the two refusals are a
+different defect entirely.
+
+**`invalid_tool_params` is a family, and the layer decides the sub-kind.** These two events and
+§18's eight split by which component can see the fault:
+
+| sub-kind | example | visible to |
+|---|---|---|
+| missing/malformed parameter | `{}` for a required key (§18) | the proxy — it holds the schema |
+| value that is wrong | a path that does not exist, a span that does not match | only the executor |
+| no occurrence in the file | `old_string` absent | only the executor |
+
+The proxy can warn on the first and never on the other two, and that is the correct division: an
+executor is the only component that can know whether `project_io_foundation.py` is a file. The
+instrumentation consequence is that the monitor's `TOOL_ERROR` stream, not the proxy journal, is
+where this class is counted — the two instruments are separate by design (§19).
 
