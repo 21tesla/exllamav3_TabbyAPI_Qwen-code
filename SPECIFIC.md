@@ -577,10 +577,13 @@ unlabelled, though, that row reads as model behaviour in the same transcript the
 studied in, which is exactly the kind of contamination this document exists to prevent.
 
 **The mistake was the precondition, not the restart.** An idle *client* was checked and an idle
-*proxy* was not. The proxy holds an accepted connection for the whole generation, so the signal is
-`ss -tnp | grep 8081` showing an `ESTAB` pair (`node` ↔ `python`), or the journal's last line not
-being a request in progress. The transcript's mtime only proves the client is between turns, which
-is a different question.
+*proxy* was not. The transcript's mtime only proves the client is between turns, which is a
+different question. **The proxy-side test given here in the first draft — `ss -tnp | grep 8081`
+showing an `ESTAB` pair — is wrong**, and was corrected on 09-27 after measuring it: that pair is a
+persistent keep-alive socket and sits there while the proxy is idle (constant `2/2` over 40 s with
+no request in flight). The signals that work are the journal's last line (a request is open iff its
+line lacks its closing `POST … 200 OK`) and proxy CPU time (`ps -o cputime= -p <pid>`, unchanged
+over ~6 s means idle) — a streaming response costs real CPU, an idle socket none.
 
 Two follow-ons worth keeping:
 
@@ -693,4 +696,61 @@ Two candidate directions, neither attempted:
 written about the observer's own filter; this is the same bug, in the observer's own source, found
 only because the corrected filter was applied by hand first. The lesson generalises: an observer
 that counts by substring will report a clean run and mean nothing by it.
+
+## 17. Round 7, on the same probe: a quoted Python argument object (2026-09-27 23:16)
+
+The third probe's second evening produced a dialect the first two never did, and it defeated the
+`call_tool` fix from round 3 on two counts at once. The model wrote **five** `grep_search` calls as
+
+```
+<｜DSML｜_skill name="grep_search" args="{'pattern': 'molecule_menu|…', 'path': '/…/main_window.py'}"/>
+```
+
+and the proxy emitted **two**, one of them with no arguments at all:
+
+```
+23:16:50  [WARNING] Tool call grep_search is missing required parameter(s) ['pattern']; emitted keys were []
+23:16:50  [INFO]    Intercepted and parsed 2 tool call(s) from content: ['grep_search', 'grep_search']
+```
+
+This is round 3's dialect — the whole argument object riding on the call tag as `args=` — with two
+changes that each defeat a different piece of the reader:
+
+1. **The object is wrapped in double quotes, and written as Python.** `_ATTR_RE`'s value class was
+   `[^"\x27]*`, which forbids *any* quote inside the value, so the match on
+   `args="{'pattern': …}"` ended at the first inner `'` and captured `{` alone. The value class has
+   to admit one quote and consume to its matching one; the three spellings it now accepts are
+   `key="value"`, `key='value'` and `key={…}` as mutually exclusive arms.
+2. **What survives that is a Python literal, not JSON.** `json.loads("{'a': 1}")` fails.
+   `_parse_attr_arguments` now falls back to `ast.literal_eval`, which evaluates literals only and
+   is reached only after JSON has already failed, so a value that is valid JSON keeps the reading
+   it has always had.
+
+A third defect in the same payload is independent of both. The second `<tool_call>` carries
+`"\.index\("` in its pattern. `\.` is an escape JSON does not define, so `raw_decode` rejects the
+object and the scan resumes *past* it — which also lost a sibling call inside the same block.
+Python's literal syntax accepts `\.`, so `repair_truncated_json` now tries `literal_eval` as a last
+resort; JSON still wins whenever it can read the text.
+
+| reading | calls recovered |
+|---|---|
+| as shipped | **2**, one with `{}` arguments |
+| both attribute fixes | 3 |
+| plus the literal fallback for escapes | **4** |
+
+All four well-formed calls are `grep_search` with `pattern` and `path` intact, the `\.` preserved.
+The payload *intended* five; the last `_skill` tag was truncated by the model itself mid-argument
+(`args="{\'columnCount|…` with no closer), and a truncated tag is not recoverable from the text.
+That one is the model's, not the reader's — the first loss of the round that is.
+
+The three fixes ship together (`06ae605`) with three new `round7` self-test cases — one per defect,
+and one asserting that a JSON object still wins over the literal reading — taking the suite from
+90 to **93 cases**. The same payload replays 2 → 4.
+
+**Two more undeclared names, and what the guard is for.** The same evening produced `Dropped
+non-call DSML tag 'nest'` (23:20:49) and `'arice'` (23:23:12) — the round-4 guard catching two
+more invented wrappers, both harmless because the calls inside them were read from their own JSON
+bodies. Every undeclared name this checkpoint has produced is an envelope or a fragment of one,
+never a tool the model wished existed; that is the whole reason the guard refuses the tag rather
+than the call.
 
