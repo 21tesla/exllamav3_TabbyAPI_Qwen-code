@@ -186,8 +186,19 @@ def split_dsml_tag(tag: str) -> Tuple[str, bool, Dict[str, str], bool]:
     return keyword, is_closing, attrs, was_dsml
 
 
-def classify_dsml_tag(keyword: str, is_closing: bool, attrs: Dict[str, str], was_dsml: bool) -> str:
-    """Map a tag to one of: call, param, args, close, other."""
+def classify_dsml_tag(
+    keyword: str,
+    is_closing: bool,
+    attrs: Dict[str, str],
+    was_dsml: bool,
+    declared: Optional[set] = None,
+) -> str:
+    """Map a tag to one of: call, param, args, close, other.
+
+    `declared` is the set of tool names the request advertised, or None when it
+    declared none. It is consulted only by the guessing branch below; every other
+    path takes the name from a JSON body or an attribute and needs no oracle.
+    """
     if is_closing:
         return "close"
     if keyword in _CALL_TAGS:
@@ -204,6 +215,29 @@ def classify_dsml_tag(keyword: str, is_closing: bool, attrs: Dict[str, str], was
         # `_call` and `_placeholder`. No tool name starts with `_`, and a `name=`
         # attribute settles it, so only the bare fragment is refused.
         if attrs.get("name") or not keyword.startswith("_"):
+            guessed = attrs.get("name") or keyword
+            # This is the only branch that *guesses* a call name: everywhere else the
+            # name is read from a JSON `{"name": ...}` body or a `name=` attribute, so
+            # the client's own schema can reject it in the model's terms. Here it is
+            # whatever word the model wrote inside a DSML tag, and the model writes
+            # plenty that are not tools -- envelopes it invented (`<|DSML|tool_read>`
+            # around the real call, `<|DSML|Output call_...>` echoing a client error
+            # back at itself) and fragments of its own markup (`oduct`, `on`, `all`,
+            # `ead`). Measured 2026-09-26: 19 distinct such names in one session, every
+            # one of them refused by the client. Refuse the tag when the request
+            # declared a tool list that does not contain the name; with no list to
+            # check, keep the old reading.
+            #
+            # Refusing the *tag* rather than the emitted call is what heals the
+            # duplicate: an invented wrapper around a real call leaves that call to be
+            # read from its own JSON body, whereas killing the frame afterwards would
+            # have consumed the inner call as the frame's own content and lost it.
+            if declared is not None and guessed not in declared:
+                logger.info(
+                    f"Dropped non-call DSML tag {guessed!r}: not one of the "
+                    f"{len(declared)} tools this request declared"
+                )
+                return "other"
             return "call"
     return "other"
 
@@ -288,8 +322,15 @@ def _parse_attr_arguments(value: str) -> Dict[str, Any]:
     return {}
 
 
-def parse_dsml_tool_calls(content: str) -> Tuple[List[dict], Optional[int]]:
-    """Extract DSML tool calls; also return the offset where the syntax begins."""
+def parse_dsml_tool_calls(
+    content: str, declared: Optional[set] = None
+) -> Tuple[List[dict], Optional[int]]:
+    """Extract DSML tool calls; also return the offset where the syntax begins.
+
+    `declared` is passed through to the tag classifier, which uses it to refuse a
+    tag whose keyword is not a tool the request advertised; see there for why that
+    check can only be made on the one branch that guesses a name.
+    """
     calls: List[dict] = []
     stack: List[dict] = []
     first: Optional[int] = None
@@ -303,7 +344,7 @@ def parse_dsml_tool_calls(content: str) -> Tuple[List[dict], Optional[int]]:
         cursor = match.end()
 
         keyword, is_closing, attrs, was_dsml = split_dsml_tag(fold_dsml_syntax(match.group(0)))
-        kind = classify_dsml_tag(keyword, is_closing, attrs, was_dsml)
+        kind = classify_dsml_tag(keyword, is_closing, attrs, was_dsml, declared)
         if kind == "call":
             name = attrs.get("name") or (keyword if keyword not in _CALL_TAGS else None)
             frame = {"kind": "call", "name": name, "args": {}}
@@ -832,8 +873,17 @@ def _strip_repetition_tail(text: Optional[str]) -> Optional[str]:
     return stripped
 
 
-def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str]]:
-    """Robustly extracts tool calls from content in JSON, DSML, XML, or pseudo formats."""
+def extract_tool_calls(
+    content: str, tools: Optional[list] = None
+) -> Tuple[Optional[List[dict]], Optional[str]]:
+    """Robustly extracts tool calls from content in JSON, DSML, XML, or pseudo formats.
+
+    `tools` is the request's declared tool list, when the caller has it. It is only
+    used to reject a DSML tag whose keyword is not a declared tool; see
+    `classify_dsml_tag`, which is the sole guessing path. A call read from a JSON
+    body is never filtered here: the client is the one that decides whether a name
+    it was handed is real.
+    """
     if not content:
         return None, content
 
@@ -887,7 +937,7 @@ def extract_tool_calls(content: str) -> Tuple[Optional[List[dict]], Optional[str
 
 
     # 1. DSML tool invocations (every dialect, incl. escaped and bare-close forms)
-    dsml_calls, dsml_start = parse_dsml_tool_calls(content)
+    dsml_calls, dsml_start = parse_dsml_tool_calls(content, _declared_tool_names(tools))
     if dsml_start is not None:
         first_start = min(first_start, dsml_start)
     for dsml_call in dsml_calls:
@@ -1034,7 +1084,7 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
     # Attempt to extract tool calls from content first
     extracted_calls = None
     if content:
-        extracted_calls, cleaned_content = extract_tool_calls(content)
+        extracted_calls, cleaned_content = extract_tool_calls(content, tools)
         if extracted_calls:
             msg["tool_calls"] = extracted_calls
             msg["content"] = cleaned_content
@@ -1045,7 +1095,7 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
 
     # If not in content, check reasoning_content (in case model emitted tools before </think>)
     if reasoning and not extracted_calls:
-        extracted_calls, cleaned_reasoning = extract_tool_calls(reasoning)
+        extracted_calls, cleaned_reasoning = extract_tool_calls(reasoning, tools)
         if extracted_calls:
             msg["tool_calls"] = extracted_calls
             msg["reasoning_content"] = cleaned_reasoning
@@ -2240,6 +2290,61 @@ def _selftest() -> int:
         failures += 1
         print(f"     expected quiet=True finish='tool_calls'; warnings={captured!r}")
 
+    # The name-as-tag-name branch is the one place a call name is *guessed* rather
+    # than read. The model writes invented envelopes inside DSML tags -- a wrapper
+    # around the real call (`<|DSML|tool_read>`), and a reply envelope echoing a
+    # client error back at itself (`<|DSML|Output call_...>`) -- and one session on
+    # 2026-09-26 produced 19 distinct such names, every one refused by the client.
+    # Refusing the tag that is not a declared tool both removes the bogus call and
+    # heals the duplicate: the wrapper's real call is read from its own JSON body,
+    # so the same read no longer goes out twice under two names.
+    guard_tools = [{"type": "function", "function": {"name": "read_file"}}]
+    wrapped_read = (
+        "<tool_call>\n"
+        f"<{fw}DSML{fw}tool_read>\n"
+        "<tool_call>\n"
+        '{"name": "read_file", "arguments": {"file_path": "/tmp/x.py"}}\n'
+        "</tool_call>\n"
+        f"</{fw}DSML{fw}tool_read>\n"
+        "</tool_call>"
+    )
+    named_by_tag = (
+        "<tool_call>\n"
+        f"<{fw}DSML{fw}read_file>\n"
+        '<parameter name="file_path">"/tmp/x"</parameter>\n'
+        f"</{fw}DSML{fw}read_file>\n"
+        "</tool_call>"
+    )
+    json_body_only = (
+        "<tool_call>\n"
+        '{"name": "comment_end", "arguments": {}}\n'
+        "</tool_call>"
+    )
+    guard_cases = [
+        ("invented wrapper is refused, its real call survives",
+         wrapped_read, guard_tools, [("read_file", {"file_path": "/tmp/x.py"})]),
+        ("a declared name-as-tag-name still reads",
+         named_by_tag, guard_tools, [("read_file", {"file_path": "/tmp/x"})]),
+        ("a markup fragment is refused",
+         f"<tool_call><{fw}DSML{fw}oduct></{fw}DSML{fw}oduct></tool_call>",
+         guard_tools, []),
+        ("a reply envelope is refused",
+         f"<{fw}DSML{fw}Output call_2ad4e2a2> params must have required property 'path' </{fw}DSML{fw}Output>",
+         guard_tools, []),
+        ("no declared list keeps the old reading",
+         named_by_tag, None, [("read_file", {"file_path": "/tmp/x"})]),
+        ("a JSON-body name is never filtered here",
+         json_body_only, guard_tools, [("comment_end", {})]),
+    ]
+    for label, raw, tools_arg, expected in guard_cases:
+        calls, _cleaned = extract_tool_calls(raw, tools_arg)
+        got = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in (calls or [])]
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} guard {label}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -2258,6 +2363,7 @@ def _selftest() -> int:
         + len(arg_cases)
         + len(round3_cases)
         + 1
+        + len(guard_cases)
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
