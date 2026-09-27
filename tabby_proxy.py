@@ -1119,6 +1119,46 @@ def _log_tool_call_shapes(calls: Optional[List[dict]], raw: str, tools: Optional
                 logger.warning(f"Raw tool-call payload: {raw[:_RAW_MAX]!r}")
 
 
+# Result-shaped text the model writes into its *own* completion. The client never
+# emits either form -- a tool result is a `functionResponse` record the client
+# re-injects as a user turn, not inline text -- so their presence is the tell that
+# the model has drifted off the protocol and is narrating the tool exchange itself.
+_TOOL_RESULT_ECHO_RE = re.compile(r"\[Tool Output call_([0-9a-fA-F]+)\]")
+_DRIFT_TOOL_CLOSER_RE = re.compile(r"</tool_command>", re.IGNORECASE)
+
+
+def _log_result_fabrication(text: Optional[str], calls: Optional[List[dict]]) -> None:
+    """Flag tool-*result* text the model wrote into its own completion.
+
+    Observed live 2026-09-27 (analysis-qt6, session e5e8c7f9): a completion beside
+    its 89 real calls carried **8 `[Tool Output call_...]` blocks and 5
+    `</tool_command>` closers**, and the prose reasoned from them -- "the affected
+    tests passed", "FOUND" -- as if the tools had run. The client never emits either
+    form (a result is a `functionResponse` record re-injected as a user turn), and
+    no genuine envelope here closes with `</tool_command>` -- the call form closes
+    with `</｜DSML｜>`. A model that invents the *output* half can treat a result it
+    narrated as one it received, which is why this earns a warning even though the
+    parser ignores the text: a fabricated result is invisible to every schema check,
+    because there is no call to check. The ids are not compared against `calls` --
+    the extractor assigns every call a fresh `call_<uuid>` id, so no comparison
+    against them could ever discriminate.
+    """
+    if not text:
+        return
+    blocks = len(_TOOL_RESULT_ECHO_RE.findall(text))
+    closers = len(_DRIFT_TOOL_CLOSER_RE.findall(text))
+    if not blocks and not closers:
+        return
+    logger.warning(
+        "Completion carries result-shaped text the client never emits: "
+        f"{blocks} '[Tool Output call_...]' block(s), {closers} "
+        "'</tool_command>' closer(s); the model may be reasoning from results it "
+        "wrote rather than received"
+    )
+    if _RAW_LOG:
+        logger.warning(f"Raw tool-call payload: {text[:_RAW_MAX]!r}")
+
+
 # A repetition loop of *opening* tags with nothing inside them. Captured live
 # (2026-09-26, analysis-qt6 sessions e8ee13a8 and df6f0ecc) after an upstream 500:
 # a completion of ~900 tokens that is nothing but `<tool_call>` repeated, with no
@@ -1413,6 +1453,7 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
             msg["content"] = cleaned_content
             choice["finish_reason"] = "tool_calls"
             _log_tool_call_shapes(extracted_calls, content, tools)
+            _log_result_fabrication(cleaned_content, extracted_calls)
             logger.info(f"Intercepted and parsed {len(extracted_calls)} tool call(s) from content: {[c['function']['name'] for c in extracted_calls]}")
             return
 
@@ -1424,6 +1465,7 @@ def process_message_tools_and_thinking(msg: dict, choice: dict, tools: Optional[
             msg["reasoning_content"] = cleaned_reasoning
             choice["finish_reason"] = "tool_calls"
             _log_tool_call_shapes(extracted_calls, reasoning, tools)
+            _log_result_fabrication(cleaned_reasoning, extracted_calls)
             logger.info(f"Intercepted and parsed {len(extracted_calls)} tool call(s) from reasoning: {[c['function']['name'] for c in extracted_calls]}")
             return
 
@@ -2926,6 +2968,40 @@ def _selftest() -> int:
         failures += 1
         print(f"     captured {captured!r}")
 
+    # Fabricated tool *results*: the model writing the output half into its own
+    # completion. The live shape (2026-09-27) plus the control that keeps the
+    # warning off a clean completion.
+    _fab = (
+        "Compile is clean.\n<tool_call>\n"
+        '{"name":"run_shell_command","arguments":{"command":"pytest -q"}}\n</tool_call>'
+        "[Tool Output call_56dc8eee]:\nFOUND\n</tool_command>The tests passed."
+    )
+    captured = []
+    logger.warning = lambda message, *a, **k: captured.append(str(message))
+    try:
+        _log_result_fabrication(_fab, None)
+    finally:
+        logger.warning = _orig_warning
+    ok = any("result-shaped text" in m for m in captured)
+    print(f"{'ok  ' if ok else 'FAIL'} monitor fabricated tool-result text is flagged")
+    if not ok:
+        failures += 1
+        print(f"     captured {captured!r}")
+
+    captured = []
+    logger.warning = lambda message, *a, **k: captured.append(str(message))
+    try:
+        _log_result_fabrication(
+            '<tool_call>\n{"name":"read_file","arguments":{"file_path":"/x"}}\n</tool_call>',
+            None)
+    finally:
+        logger.warning = _orig_warning
+    ok = not captured
+    print(f"{'ok  ' if ok else 'FAIL'} monitor a clean completion raises no fabrication warning")
+    if not ok:
+        failures += 1
+        print(f"     captured {captured!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -2952,6 +3028,7 @@ def _selftest() -> int:
         + len(round6_cases)
         + len(round7_cases)
         + 3
+        + 2
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
