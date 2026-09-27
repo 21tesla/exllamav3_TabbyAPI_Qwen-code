@@ -1050,3 +1050,27 @@ the bytes it captured are the only reason the failure could be replayed and name
 earned their place — but attributing the catch to the wrong one would put a false confidence in
 §19's net for a case it does not reach.
 
+**The resume is the control, and it reclassifies the defect as stochastic — not a fixed content
+trigger.** The session resumed at `00:02:59` (local) / `04:02:59Z`, and at `04:03:39Z` the model
+re-issued the edit it had lost, in a five-call batch. This time it **escaped its quotes** — the
+recovered bytes carry `\"stated-but-unbound\"` and `\" \"`, zero bare quotes — so the object parsed
+on the ordinary `raw_decode` path and `repair_unescaped_quotes` was **never reached**. The edit
+applied; the lost `_display_label` work is now on disk. The same logical argument that dropped its
+call at ~205k emitted clean JSON at ~136k, which locates the defect in the *emission* (a
+context-dependent degradation of the serializer) rather than in the *content* (`"` in a comment). The
+new repair is therefore a safety net, and this rerun routed around it — as of this writing it is
+deployed and self-tested but **has no live firing**, and honesty requires saying so. It also needs no
+live firing to be correct: it sits behind `raw_decode` failure, so on well-formed JSON it is
+unreachable and cannot misfire.
+
+The same batch carried a *second*, distinct member of the malformed-argument family: an `edit` whose
+object was **complete but key-incomplete** — `file_path` and `old_string`, no `new_string`. That is
+valid JSON, so it is nobody's parse problem; the proxy's §18 schema check caught it
+(`Tool call edit is missing required parameter(s) ['new_string']`) and the client independently
+refused it (`params must have required property 'new_string'`), while the sibling `edit` in the same
+batch — the *same file*, the *same argument* — applied cleanly. That sibling is the control that
+rules out anything schema-wide or transport-wide, and it is why the model recovered in a single
+step: it had a working edit to compare against. One batch, two argument-layer faults, and the
+difference between them is the difference between a call the proxy can reach and one only the schema
+check can.
+
