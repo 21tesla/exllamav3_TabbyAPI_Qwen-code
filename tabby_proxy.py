@@ -1140,6 +1140,32 @@ def _unstreamed_remainder(parsed: Optional[str], raw: str, sent: int, field: str
     return parsed[len(spoken):]
 
 
+def _merge_native_tool_calls(message: dict, native: dict) -> List[dict]:
+    """Turn accumulated native `delta.tool_calls` fragments into message tool calls.
+
+    TabbyAPI has already parsed the checkpoint's DSML into an OpenAI-shaped call,
+    so the arguments are valid JSON and are passed through verbatim: re-serialising
+    them through the scanner's own path would risk changing bytes the upstream had
+    already validated. A native call takes precedence over anything scraped out of
+    the text fields -- the upstream's parse is authoritative, and a text call that
+    happens to sit beside it is usually the raw DSML the upstream just consumed.
+    """
+    merged = []
+    for slot in native.values():
+        if not slot["name"]:
+            continue
+        arguments = slot["arguments"] or "{}"
+        merged.append({
+            "id": slot["id"] or f"call_{uuid.uuid4().hex[:8]}",
+            "type": "function",
+            "function": {"name": slot["name"], "arguments": arguments},
+        })
+    if not merged:
+        return message.get("tool_calls") or []
+    message["tool_calls"] = merged
+    return merged
+
+
 async def relay_upstream_stream(stream_ctx, response, client: httpx.AsyncClient) -> AsyncIterator[bytes]:
     """Forward upstream SSE bytes untouched (used when no tools are in play)."""
     try:
@@ -1158,6 +1184,7 @@ async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient,
     index = 0
     content_text = ""
     reasoning_text = ""
+    native_tool_calls = {}
     sent_content = 0
     sent_reasoning = 0
     held = False
@@ -1191,6 +1218,25 @@ async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient,
                     reasoning_text += delta["reasoning_content"]
                 if delta.get("content"):
                     content_text += delta["content"]
+                # TabbyAPI parses the checkpoint's native DSML server-side and, in
+                # streaming mode, delivers the call here rather than in `content`.
+                # Reading only `content`/`reasoning_content` dropped it: the scanner
+                # then found nothing, `finish_reason` stayed `tool_calls` and was
+                # downgraded to `stop`, so the client got neither a call nor a
+                # finished text turn and the session wedged (observed 2026-09-26,
+                # #431, session aba2e4e2). Collect the native fragments so they can
+                # be emitted once the stream ends.
+                for fragment in delta.get("tool_calls") or []:
+                    slot = native_tool_calls.setdefault(fragment.get("index", 0), {
+                        "id": None, "type": "function", "name": "", "arguments": "",
+                    })
+                    if fragment.get("id"):
+                        slot["id"] = fragment["id"]
+                    function = fragment.get("function") or {}
+                    if function.get("name"):
+                        slot["name"] += function["name"]
+                    if function.get("arguments"):
+                        slot["arguments"] += function["arguments"]
 
                 if not role_sent:
                     role_sent = True
@@ -1226,7 +1272,12 @@ async def stream_tools_response(stream_ctx, response, client: httpx.AsyncClient,
     process_message_tools_and_thinking(message, choice, tools)
     final_content = message.get("content")
     final_reasoning = message.get("reasoning_content")
-    tool_calls = message.get("tool_calls")
+    # A native call settles the finish reason: the upstream said `tool_calls`
+    # because it parsed one, so the empty-call downgrade inside the processor --
+    # which only saw the text fields -- must not undo it.
+    tool_calls = _merge_native_tool_calls(message, native_tool_calls)
+    if tool_calls and finish_reason == "tool_calls":
+        choice["finish_reason"] = "tool_calls"
 
     for field, parsed, raw, sent in (
         ("reasoning_content", final_reasoning, reasoning_text, sent_reasoning),
@@ -1382,6 +1433,14 @@ async def chat_completions_proxy(request: Request):
         # Parse message content / reasoning for tool calls
         for choice in resp_data.get("choices", []):
             msg = choice.get("message", {})
+            # TabbyAPI can hand back a native call here (its `deepseek_v4` format
+            # parses the checkpoint's DSML server-side), where the text fields hold
+            # nothing to scrape. Surface it so the processor sees it and leaves the
+            # finish reason alone; without this the empty-call guard below would
+            # downgrade a perfectly good call to `stop`.
+            native = msg.get("tool_calls")
+            if native and not msg.get("content") and not msg.get("reasoning_content"):
+                msg["content"] = json.dumps({"tool_calls": native})
             process_message_tools_and_thinking(msg, choice, tools)
             # Same guard as the streaming path: a finish reason of `tool_calls`
             # with an empty list is read as a malformed call and ends the turn.
@@ -1894,6 +1953,97 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {want!r}")
 
+    # A native `delta.tool_calls` stream is the case the proxy used to drop:
+    # TabbyAPI parses the checkpoint's DSML server-side and delivers the call in
+    # the delta, so no marker ever reaches a text field, the scanner finds
+    # nothing, and the `tool_calls` finish reason is downgraded to `stop` -- the
+    # client then gets neither a call nor a finished turn and the session wedges
+    # (observed 2026-09-26, #431, session aba2e4e2). Two legs: the merger must
+    # preserve the upstream arguments byte-for-byte, and the accumulator must
+    # actually read the delta.
+    native_args = '{"file_path": "/tmp/stage123.txt"}'
+    native_slots = {
+        0: {"id": "call_abc123", "type": "function", "name": "read_file", "arguments": native_args},
+        1: {"id": None, "type": "function", "name": "glob", "arguments": ""},
+    }
+    native_msg = {"content": None, "reasoning_content": None}
+    merged = _merge_native_tool_calls(native_msg, native_slots)
+    merged_pairs = [(c["function"]["name"], c["function"]["arguments"]) for c in merged]
+    merge_ok = (
+        merged_pairs == [("read_file", native_args), ("glob", "{}")]
+        and merged[0]["id"] == "call_abc123"
+        and merged[1]["id"].startswith("call_")
+        and native_msg["tool_calls"] is merged
+    )
+    print(f"{'ok  ' if merge_ok else 'FAIL'} native merge keeps upstream arguments: {merged_pairs}")
+    if not merge_ok:
+        failures += 1
+        print(f"     expected: [('read_file', {native_args!r}), ('glob', '{{}}')] with ids call_abc123/'call_*'")
+
+    class _FakeStream:
+        def __init__(self, lines):
+            self._lines = lines
+
+        async def aiter_lines(self):
+            for line in self._lines:
+                yield line
+
+    class _NoopCtx:
+        async def __aexit__(self, *exc):
+            return False
+
+    class _NoopClient:
+        async def aclose(self):
+            return None
+
+    def _evt(delta, finish=None, eos=None):
+        choice = {"index": 0, "delta": delta}
+        if finish:
+            choice["finish_reason"] = finish
+        if eos:
+            choice["eos_reason"] = eos
+        return "data: " + json.dumps({"choices": [choice]})
+
+    # The arguments arrive split across two deltas, as a real stream sends them.
+    delta_events = [
+        _evt({"role": "assistant"}),
+        _evt({"reasoning_content": "Let me read it."}),
+        _evt({"tool_calls": [{"index": 0, "id": "call_abc123", "type": "function",
+                              "function": {"name": "read_file", "arguments": '{"file_path": "/tmp/stage'}}]}),
+        _evt({"tool_calls": [{"index": 0, "function": {"arguments": '123.txt"}'}}]}),
+        _evt({}, finish="tool_calls", eos="eos"),
+        "data: [DONE]",
+    ]
+    split_args = '{"file_path": "/tmp/stage123.txt"}'  # the two fragments joined
+
+    async def _drive():
+        collected = []
+        async for chunk in stream_tools_response(
+            _NoopCtx(), _FakeStream(delta_events), _NoopClient(), "test-model", None
+        ):
+            collected.append(chunk)
+        return collected
+
+    seen_calls = []
+    seen_finish = None
+    for chunk in asyncio.run(_drive()):
+        if not chunk.startswith("data: "):
+            continue
+        body = chunk[len("data: "):].strip()
+        if not body or body == "[DONE]":
+            continue
+        event = json.loads(body)
+        for choice in event.get("choices", []):
+            for call in (choice.get("delta") or {}).get("tool_calls") or []:
+                seen_calls.append((call.get("index"), call["function"]["name"], call["function"]["arguments"]))
+            if choice.get("finish_reason"):
+                seen_finish = choice["finish_reason"]
+    delta_ok = seen_calls == [(0, "read_file", split_args)] and seen_finish == "tool_calls"
+    print(f"{'ok  ' if delta_ok else 'FAIL'} native delta.tool_calls is emitted: calls={seen_calls} finish={seen_finish!r}")
+    if not delta_ok:
+        failures += 1
+        print(f"     expected: [(0, 'read_file', {split_args!r})] finish='tool_calls'")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -1907,6 +2057,7 @@ def _selftest() -> int:
         + len(repetition_cases)
         + len(downgrade_cases)
         + len(glyph_cases)
+        + 2
         + 2
     )
     print(f"{total - failures}/{total} self-test cases passed")
