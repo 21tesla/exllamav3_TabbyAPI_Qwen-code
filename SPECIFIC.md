@@ -1255,3 +1255,76 @@ collapse; the clean turns are a *different* model answering, and the collapse wi
 opened the section's monitoring: a run of proxy-silent turns is not necessarily a broken interception
 path — check the `model` field of the assistant records first.
 
+## 22. The `name`-element dialect: two completions the scanner read as no call at all (2026-09-27)
+
+Session `1c997e7d` (analysis-qt6, `DeepSeek-V4-Flash-0731-exl3-2.32bpw`) ran 07:22→13:27 EDT and
+ended with two turns that parsed to **zero calls**. The user's summary was exact — "crashed twice
+with spurious tags, I couldn't recover the session". The tags were spurious in the literal sense:
+they are elements the client never emits, and the scanner had no frame for them.
+
+| when (local) | completion | intended | parsed by the old proxy |
+| --- | --- | --- | --- |
+| 13:15:42 | 2 657 chars | 2 `edit` calls | **0** |
+| 13:22:58 | 519 chars | 2 `read_file` calls | **0** |
+
+Both carried the same dialect — the call *name* on its own element, the arguments in an
+`arguments` element beside it, with no `name=` attribute anywhere:
+
+```
+<|DSML|name>edit</|DSML|name>
+<|DSML|arguments>{"file_path": "…", "old_string": "…", "new_string": "…"}</|DSML|arguments>
+```
+
+The second completion shows how loose the form is: the second call's `arguments` opener is *missing*,
+so the JSON sits directly after the name, and the closer the model did write is a stray
+`</|DSML|arguments>`; the turn ends with a fabricated `</|DSML|output>` (the result-half marker that
+§16's detector watches for, here as a bare tag rather than a `[Tool Output …]` block).
+
+**Why nothing was read.** `classify_dsml_tag` reads a call from a `JSON {"name": …}` body or a
+`name=` attribute; `<|DSML|name>` is neither, and its keyword is not in `_CALL_TAGS`, so it
+classified as `other` and opened no frame. The following `</|DSML|name>` matched no open frame either,
+so it too was ignored. The `arguments` element opened an `args` frame and collected its JSON, but with
+no `call` frame above it the close folded the object into nothing. The turn therefore held only
+`other`, `close` and `args`, and `extract_tool_calls` returned *no call*. Upstream had set
+`tool_calls`, so `process_message_tools_and_thinking` took its §20-safe path and answered **`stop`**
+rather than `tool_calls: null` — the client did not abort, but the model was handed a turn in which
+the call it wrote neither ran nor came back, and it never recovered. The journal's own verdict is
+three lines: `Dropped non-call DSML tag 'name'` (once per opener), then
+`Upstream said tool_calls but no call was parsed`.
+
+**A latent duplicate fell out of the diagnosis.** With no declared tool list, `classify_dsml_tag`'s
+guess branch reads any bare DSML keyword as a call name — so `<|DSML|name>` would have produced a
+call literally named `name`, and `<|DSML|output>` one named `output`, beside the real call. The
+declared-tools path already refused both (the journal's `Dropped non-call DSML tag 'name': not one of
+the 20 tools` is that refusal); the undeclared path did not. Closed by the same change.
+
+**The fix — `parse_name_element_tool_calls`, a pass of its own.** The main scanner is the wrong place
+for this dialect: it needs no enclosing `<tool_call>` (the first capture has one, the second does
+not), and its argument block is raw `{`…`}` text that the frame walker would treat as frame content.
+So the new pass is driven by the name elements themselves, each block running to the next, and it
+reuses the scanner's own readers rather than re-deriving them: `_first_json_object` applies the
+typographic fold, `repair_truncated_json` and `repair_unescaped_quotes` in the scanner's order, so a
+`name`-element call mangles the same ways it always does; `_name_element_args` then falls back to the
+per-argument children (`<|DSML|param file_path="…">`) when no object is present. A block with **no**
+argument block emits **no** call, which is what keeps a model quoting this syntax in an explanation
+from being read as a call. The opener is also added to the marker patterns and `_TOOL_MARKER_RE`, so
+the streaming hold-back and the scanner agree on where the syntax begins — otherwise the marker text
+is emitted live and the call arrives doubled. `_STRUCTURAL_TAGS = {name, output, tool_name}` refuses
+the field keywords in the guess branch.
+
+**Verification.** The two captures were replayed byte-for-byte through the parser: they now yield
+`edit{file_path, old_string, new_string}` and `read_file{file_path, limit, offset}` ×2 — exactly the
+calls the model wrote. Every raw-unparsed payload in the journal since 2026-09-26 (30 of them) was
+re-run to rule out regressions: only the two `name`-element captures change; a plain `<|DSML|name>` in
+prose still yields nothing. Self-test **129/129** (14 new: object form, missing-closer form, the three
+bar spellings, a repaired truncated object, the per-argument form, two no-call guards, three
+field-tag refusals, the marker offset, a positive-trace check, and one streaming case that splits the
+opener across two deltas and asserts the call comes out whole with the prose emitted and no markup
+leaked).
+
+**A note on method.** The diagnosis could not be made by reading the journal: this harness masks
+tool-call-shaped text, so the rendered `Raw unparsed completion` shows placeholder tags. The real
+structure came from pulling each payload out of the journal with `ast.literal_eval` and printing it
+with the bar rewritten (`|`→`!`, `DSML`→`dsml`) — after which the element shape is unmistakable. Any
+future parser fault on this model should be read the same way (see also §13).
+
