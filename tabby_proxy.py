@@ -92,6 +92,24 @@ _CALL_NAME_KEYS = {"name", "tool", "tool_name", "function"}
 _CALL_ARGS_KEYS = {"args", "arguments"}
 _CALL_META_KEYS = {"name", "function", "tool", "tool_name", "action", "type", "id"}
 
+# The checkpoint sometimes names an argument in its own words rather than the
+# schema's -- observed 2026-09-26 writing `path` for `read_file`'s `file_path`.
+# Nothing structural can recover that, so the canonical schema is consulted as an
+# alias oracle: a spelled-out key is renamed to the declared one *only* when the
+# declared key exists and the shorthand does not. That is what keeps `-r` a real
+# flag if a tool ever declares one. Each alias maps to exactly one canonical name,
+# so a rename is never ambiguous.
+_ALIAS_PREFERENCE = {
+    "file_path": ("path", "filepath", "file", "filename", "target"),
+    "pattern": ("query", "regex", "search", "q", "needle"),
+    "old_string": ("old", "old_str", "find", "search_string"),
+    "new_string": ("new", "new_str", "replace", "replace_with", "replacement"),
+    "content": ("text", "data", "body", "contents"),
+    "command": ("cmd", "shell", "script"),
+    "file_pattern": ("glob", "file_glob"),
+}
+_ALIASES = {alias: canonical for canonical, alts in _ALIAS_PREFERENCE.items() for alias in alts}
+
 
 # A completion past roughly 180k tokens starts losing ASCII: `"` becomes `“`/`”`
 # and `|` becomes the fullwidth `｜` (U+FF5C). Neither is a quoting or bar character
@@ -207,6 +225,15 @@ def classify_dsml_tag(
         return "param"
     if keyword in _ARG_CONTAINER_TAGS:
         return "args"
+    # A call element can carry each argument as a child element named after it
+    # (`<|DSML| name="read_file"><path>…</path><offset>260</offset></|DSML|>`).
+    # The child is recognisable only by context: it is a plain element, but a call
+    # frame is open, so it is that call's argument rather than prose. Without this
+    # the child stayed `other`, nothing collected its body, and the frame closed
+    # empty -- observed 2026-09-26 as one `read_file` with `{}` standing in for the
+    # seven the model wrote (the duplicate signature deduped the rest away).
+    if not is_closing and not was_dsml and keyword and not attrs:
+        return "element"
     if was_dsml and not is_closing and (attrs.get("name") or keyword):
         # A DSML tag carrying a keyword is normally the `name`-as-tag-name dialect
         # (`<|DSML|read_file>`), so it reads as a call. A keyword beginning with `_`
@@ -255,6 +282,8 @@ def _close_dsml_frame(stack: List[dict], keyword: str, calls: List[dict]) -> Non
             break
         if frame["kind"] == "args" and keyword in _ARG_CONTAINER_TAGS:
             break
+        if frame["kind"] == "element" and keyword == frame["name"]:
+            break
         idx -= 1
     else:
         return
@@ -278,6 +307,16 @@ def _close_dsml_frame(stack: List[dict], keyword: str, calls: List[dict]) -> Non
         for parent in reversed(stack):
             if parent["kind"] == "call":
                 parent["args"].update(frame["args"])
+                break
+    elif frame["kind"] == "element":
+        # One argument as a child element, named for the argument. The body is left a
+        # string on purpose: what type the client wants is a schema question, settled
+        # once against the declared tools in `_apply_schema_types` rather than guessed
+        # here.
+        value = "".join(frame["buf"]).strip()
+        for parent in reversed(stack):
+            if parent["kind"] == "call":
+                parent["args"][frame["name"]] = value
                 break
     elif frame["kind"] == "param":
         value = "".join(frame["buf"]).strip()
@@ -341,6 +380,8 @@ def parse_dsml_tool_calls(
             stack[-1]["buf"].append(content[cursor:match.start()])
         elif stack and stack[-1]["kind"] == "args":
             stack[-1]["raw"].append(content[cursor:match.start()])
+        elif stack and stack[-1]["kind"] == "element":
+            stack[-1]["buf"].append(content[cursor:match.start()])
         cursor = match.end()
 
         keyword, is_closing, attrs, was_dsml = split_dsml_tag(fold_dsml_syntax(match.group(0)))
@@ -379,6 +420,13 @@ def parse_dsml_tool_calls(
             stack.append({"kind": "args", "args": {}, "raw": []})
             if first is None:
                 first = match.start()
+        elif kind == "element" and any(f["kind"] == "call" for f in stack):
+            # Guarded on an open call: an element named in prose, with no call frame
+            # to hold it, stays prose and must not open a frame that would swallow
+            # the text after it.
+            stack.append({"kind": "element", "name": keyword, "buf": []})
+            if first is None:
+                first = match.start()
         elif kind == "close":
             _close_dsml_frame(stack, keyword, calls)
 
@@ -386,6 +434,8 @@ def parse_dsml_tool_calls(
         stack[-1]["buf"].append(content[cursor:])
     elif stack and stack[-1]["kind"] == "args":
         stack[-1]["raw"].append(content[cursor:])
+    elif stack and stack[-1]["kind"] == "element":
+        stack[-1]["buf"].append(content[cursor:])
     while stack:
         _close_dsml_frame(stack, "", calls)
 
@@ -784,6 +834,93 @@ def _declared_tool_names(tools: Optional[list]) -> Optional[set]:
     return names or None
 
 
+def _tool_properties(name: str, tools: Optional[list]) -> Optional[dict]:
+    """The declared property schemas for `name`, else None if the tool is unknown."""
+    if not tools:
+        return None
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        func = tool.get("function")
+        if not isinstance(func, dict) or func.get("name") != name:
+            continue
+        schema = func.get("parameters")
+        if isinstance(schema, dict) and isinstance(schema.get("properties"), dict):
+            return schema["properties"]
+        return {}
+    return None
+
+
+def _coerce_to_type(value: Any, prop: dict) -> Any:
+    """Read an attribute- or element-borne string the way the property declares it.
+
+    Every value that arrives by one of those two routes is a string, because that is
+    what an attribute and an element body are. A property declared `integer` still
+    wants a number, and the client validates: `read_file`'s `offset` is
+    `["integer","null"]`, so the string `"260"` it was handed was a rejected call.
+    Only the unambiguous conversions are made -- a bare integer or float literal --
+    and anything else is left exactly as it was, so nothing is invented.
+    """
+    if not isinstance(value, str):
+        return value
+    types = prop.get("type")
+    types = types if isinstance(types, list) else [types]
+    text = value.strip()
+    if not text:
+        return value
+    if "integer" in types and re.fullmatch(r"-?\d+", text):
+        return int(text)
+    if "number" in types and re.fullmatch(r"-?\d+(\.\d+)?([eE][-+]?\d+)?", text):
+        return float(text)
+    if "boolean" in types and text.lower() in ("true", "false"):
+        return text.lower() == "true"
+    return value
+
+
+def _parse_json_string(value: Any) -> Any:
+    """A string that is really JSON (an object or array) is passed through as JSON."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or text[0] not in "{[":
+        return value
+    try:
+        return json.loads(text, strict=False)
+    except Exception:
+        return repair_truncated_json(text)
+
+
+def _normalize_call_args(name: str, args: dict, tools: Optional[list]) -> dict:
+    """Bring an argument dict in line with the schema the request declared.
+
+    Two mismatches are read here, both from the same root: the model names things its
+    own way. A shorthand key is renamed to the declared one (`path` -> `file_path`),
+    and a value carried as text is retyped to the declared type (the string `"260"`
+    for an `integer`). Each rename requires the declared key to exist and the
+    shorthand not to, so a short name that is genuinely the tool's own is never
+    touched. Properties not in the schema are left alone: the client's schemas do not
+    forbid extra keys, and inventing arguments is not this function's job.
+    """
+    properties = _tool_properties(name, tools)
+    if not properties or not isinstance(args, dict):
+        return args
+    renamed = {}
+    for key, value in args.items():
+        target = key
+        if key not in properties:
+            candidate = _ALIASES.get(key)
+            if candidate and candidate in properties and candidate not in args:
+                target = candidate
+                logger.info(f"Renamed argument {key!r} to {target!r} for tool {name!r}")
+        prop = properties.get(target)
+        if isinstance(prop, dict):
+            value = _coerce_to_type(value, prop)
+            if prop.get("type") == "object" or prop.get("type") == "array":
+                value = _parse_json_string(value)
+        renamed[target] = value
+    return renamed
+
+
 def _log_tool_call_shapes(calls: Optional[List[dict]], raw: str, tools: Optional[list]) -> None:
     """Flag extracted calls the client cannot dispatch, or that dropped a required parameter.
 
@@ -915,10 +1052,16 @@ def extract_tool_calls(
         if isinstance(args, str):
             try:
                 parsed = json.loads(args, strict=False)
+                if isinstance(parsed, dict):
+                    parsed = _normalize_call_args(name, parsed, tools)
                 args_str = json.dumps(parsed)
             except Exception:
                 args_str = args
         elif isinstance(args, dict):
+            # Settle the argument names and types against the declared schema here,
+            # once, so every dialect benefits -- the attribute and element routes both
+            # yield strings, and one of them named the parameter its own way.
+            args = _normalize_call_args(name, args, tools)
             args_str = json.dumps(args)
         else:
             args_str = json.dumps(args) if args is not None else "{}"
@@ -2388,6 +2531,56 @@ def _selftest() -> int:
             failures += 1
             print(f"     expected: {expected!r}")
 
+    # Arguments can also arrive as child elements named for the argument, and the
+    # model may name one in its own words. Both are settled against the declared
+    # schema: a value carried as text is retyped to what the property declares (an
+    # element body is text, and `offset` is an integer), and a shorthand key is
+    # renamed only when the declared key exists and the shorthand does not. The
+    # `glob path` leg is the point of the pair -- `glob` genuinely declares `path`,
+    # so the alias must leave it alone rather than rename it to `pattern`.
+    schema_tools = [
+        {"type": "function", "function": {"name": "read_file", "parameters": {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"},
+                           "offset": {"type": ["integer", "null"]},
+                           "limit": {"type": ["integer", "null"]}},
+            "required": ["file_path"]}}},
+        {"type": "function", "function": {"name": "glob", "parameters": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}}}}},
+    ]
+    element_call = (
+        "<tool_call>\n"
+        f'<{fw}DSML{fw} name="read_file">'
+        "<path>/tmp/x.py</path><offset>260</offset><limit>40</limit>"
+        f"</{fw}DSML{fw}>\n</tool_call>"
+    )
+    round6_cases = [
+        ("element arguments are read, renamed and retyped",
+         element_call, schema_tools,
+         [("read_file", {"file_path": "/tmp/x.py", "offset": 260, "limit": 40})]),
+        ("a shorthand that is a real property is kept",
+         f'<{fw}DSML{fw}call name="glob" path="src/**" pattern="*.py"/>', schema_tools,
+         [("glob", {"path": "src/**", "pattern": "*.py"})]),
+        ("an unknown key is neither dropped nor invented",
+         f'<{fw}DSML{fw}call name="read_file" file_path="/tmp/x" bogus="1"/>', schema_tools,
+         [("read_file", {"file_path": "/tmp/x", "bogus": "1"})]),
+        ("no declared tools leaves the arguments untouched",
+         element_call, None,
+         [("read_file", {"path": "/tmp/x.py", "offset": "260", "limit": "40"})]),
+    ]
+    for label, raw, tools_arg, expected in round6_cases:
+        calls, _cleaned = extract_tool_calls(raw, tools_arg)
+        try:
+            got = [(c["function"]["name"], json.loads(c["function"]["arguments"])) for c in (calls or [])]
+        except Exception as exc:
+            got = f"unparseable: {exc}"
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} round6 {label}: {got}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
     total = (
         len(cases)
         + len(marker_cases)
@@ -2408,6 +2601,7 @@ def _selftest() -> int:
         + 1
         + len(guard_cases)
         + len(round5_cases)
+        + len(round6_cases)
     )
     print(f"{total - failures}/{total} self-test cases passed")
     return 1 if failures else 0
