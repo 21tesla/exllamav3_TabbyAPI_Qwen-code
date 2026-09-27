@@ -1167,7 +1167,7 @@ def _log_result_fabrication(text: Optional[str], calls: Optional[List[dict]]) ->
 _TOOL_CALL_OPEN_TAG_RE = re.compile(r"<\s*tool_calls?\s*>", re.IGNORECASE)
 
 
-def _strip_repetition_tail(text: Optional[str]) -> Optional[str]:
+def _strip_tool_call_openers(text: Optional[str]) -> Optional[str]:
     """Drop a trailing run of empty `<tool_call>` openers from `text`.
 
     The run is a repetition loop, not a call: it holds no JSON, no argument and no
@@ -1213,6 +1213,105 @@ def _strip_repetition_tail(text: Optional[str]) -> Optional[str]:
         return None
     logger.warning("Dropped a repetition of empty tool-call open tags after the visible answer")
     return stripped
+
+
+# A repetition loop of the *bare wrong-glyph wrapper opener*. Captured live
+# (2026-09-27, analysis-qt6 session e5e8c7f9, three instances as context grew):
+# a completion that opens the DSML wrapper and then repeats it, with no tool name,
+# no `tool_calls`, no arguments and no nearer -- 98, then 178, then 266 openers.
+# Every opener is followed only by further openers (and, when the loop is loose,
+# by a repeated intent sentence), so the run holds nothing dispatchable. Unlike
+# the `<tool_call>` loop above, the run can carry prose *between* the delimiters,
+# so dropping only the delimiters keeps what the model actually wrote and turns a
+# degenerate wall into a readable end-of-turn.
+#
+# The bar is deliberately both ASCII `|` and the fullwidth U+FF5C the model
+# drifts into. `_DSML_WORD` is `DSML` case-insensitively, matching how
+# `parse_dsml_tool_calls` reads a wrapper. A nearer (`</`) or a `tool_calls`
+# keyword anywhere between two openers ends the run, so a *genuine* wrong-glyph
+# call -- `<|DSML|tool_calls>...<|DSML|tool name=...>...</|DSML|tool>` -- is left
+# for `34eb6d5`'s recovery, which is the path that can actually dispatch it.
+_BARE_DSML_WRAPPER_RE = re.compile(
+    r"<[|\uff5c]DSML[|\uff5c]>",
+    re.IGNORECASE,
+)
+_RUN_BREAK_RE = re.compile(r"</|tool_calls", re.IGNORECASE)
+# A stream cut mid-opener leaves a half-written wrapper (`<|DSML|`, no closer),
+# which is a fragment and can never be a call -- the same shape the `<tool_call>`
+# strip ignores at the tail. Only matched at end-of-text, where it cannot be the
+# start of a real opener that simply continues past the captured window.
+_PARTIAL_OPENER_TAIL_RE = re.compile(r"<[|\uff5c]?\s*DSML[|\uff5c]?\s*$", re.IGNORECASE)
+
+
+def _strip_markup_repetition(text: Optional[str]) -> Optional[str]:
+    """Collapse a run of bare wrong-glyph DSML wrapper openers in `text`.
+
+    Returns `text` unchanged when `text` holds no such run, or holds runs too short
+    to be the repetition loop (a lone wrapper opener is real markup and must reach
+    `parse_dsml_tool_calls`). When a run is found it is rebuilt: the openers are
+    dropped, and the text *between* them is kept but de-duplicated, so a loop that
+    repeats one intent sentence 24 times leaves that sentence once. The result is
+    `rstrip`ped so the degenerate wall ends at the last real token.
+
+    Only runs whose interior holds *nothing but* openers and prose are collapsed:
+    a `</` or a `tool_calls` between two openers means the run straddles real
+    markup, so it is left intact for the DSML parser and the wrong-glyph recovery.
+    """
+    if not text or "<" not in text:
+        return text
+    openers = list(_BARE_DSML_WRAPPER_RE.finditer(text))
+    if len(openers) < 2:
+        return text
+    # The longest consecutive chain of openers whose gaps hold no `</` and no
+    # `tool_calls`. Track the widest such chain so a short run that happens to sit
+    # beside real markup is not mistaken for the loop.
+    best = None
+    chain = [openers[0]]
+    for prev, cur in zip(openers, openers[1:]):
+        between = text[prev.end():cur.start()]
+        if _RUN_BREAK_RE.search(between):
+            if len(chain) > (len(best) if best else 0):
+                best = chain
+            chain = [cur]
+        else:
+            chain.append(cur)
+    if len(chain) > (len(best) if best else 0):
+        best = chain
+    if not best or len(best) < 2:
+        return text
+    # Rebuild the chain: drop the openers, keep each distinct span of text once.
+    # The spans are the gaps between successive openers *plus* the text after the
+    # last opener -- a loop repeats the intent sentence on both sides of the
+    # delimiters, so including the tail is what leaves it once rather than twice.
+    spans, seen = [], set()
+    for prev, cur in zip(best, best[1:]):
+        gap = text[prev.end():cur.start()]
+        if gap not in seen:
+            seen.add(gap)
+            spans.append(gap)
+    tail = text[best[-1].end():]
+    tail = _PARTIAL_OPENER_TAIL_RE.sub("", tail)
+    if tail not in seen:
+        spans.append(tail)
+    rebuilt = text[:best[0].start()] + "".join(spans)
+    logger.warning(
+        f"Collapsed a run of {len(best)} bare wrong-glyph DSML wrapper opener(s); "
+        "kept each distinct span of prose between them once"
+    )
+    return rebuilt.rstrip()
+
+
+def _strip_repetition_tail(text: Optional[str]) -> Optional[str]:
+    """Drop the repetition loops a degenerate completion can end on.
+
+    Composes the two shapes seen live: a trailing run of empty `<tool_call>`
+    openers (`2026-09-26`), and a run of bare wrong-glyph DSML wrapper openers
+    (`2026-09-27`). The `<tool_call>` strip runs first because it can delete an
+    entire all-opener completion; the wrong-glyph strip then cleans whatever
+    delimiter run remains in the prose it kept.
+    """
+    text = _strip_tool_call_openers(text)
+    return _strip_markup_repetition(text)
 
 
 def extract_tool_calls(
@@ -2404,6 +2503,51 @@ def _selftest() -> int:
     if not ok:
         failures += 1
 
+    # The wrong-glyph wrapper loop (2026-09-27): a run of bare `<|DSML|>` openers,
+    # the delimiters the model drifts into at long context. Captured live at 98,
+    # 178 and 266 openers; the strip must collapse each to its prose, leave a lone
+    # opener and a genuine wrapper *call* alone, and never fabricate a call.
+    _fw = "\uff5c"
+    bare = f"<{_fw}DSML{_fw}>"
+    markup_cases = [
+        ("pure run collapses to its prefix",
+         "Now let me look at the header:\n" + "\n".join([bare] * 266),
+         "Now let me look at the header:"),
+        ("a repeated intent sentence is kept once",
+         "Head.\n" + "".join(bare + "\nLet me read it.\n" for _ in range(24)),
+         "Head.\n\nLet me read it."),
+        ("a partial trailing opener is dropped",
+         "Head.\n" + "\n".join([bare] * 5) + "\n<" + _fw + "DSML" + _fw,
+         "Head."),
+        ("a lone opener is left for the parser", f"Prose.\n{bare}", f"Prose.\n{bare}"),
+        ("ASCII-bar form is also collapsed", "P.\n" + "\n".join(["<|DSML|>"] * 5), "P."),
+        ("two openers are already a run", "P.\n" + bare + "\n" + bare, "P."),
+        ("an opener with real text after it is untouched",
+         f"P.\n{bare}\nnothing", f"P.\n{bare}\nnothing"),
+        ("a genuine wrapper call is not stripped",
+         f"<{_fw}DSML{_fw}tool_calls>\n<{_fw}DSML{_fw}tool name=\"read_file\">\n"
+         f"<{_fw}DSML{_fw}parameter name=\"file_path\">/tmp/x</{_fw}DSML{_fw}parameter>\n"
+         f"</{_fw}DSML{_fw}tool>\n</{_fw}DSML{_fw}tool_calls>",
+         f"<{_fw}DSML{_fw}tool_calls>\n<{_fw}DSML{_fw}tool name=\"read_file\">\n"
+         f"<{_fw}DSML{_fw}parameter name=\"file_path\">/tmp/x</{_fw}DSML{_fw}parameter>\n"
+         f"</{_fw}DSML{_fw}tool>\n</{_fw}DSML{_fw}tool_calls>"),
+    ]
+    for name, raw, expected in markup_cases:
+        got = _strip_repetition_tail(raw)
+        ok = got == expected
+        print(f"{'ok  ' if ok else 'FAIL'} markup repetition {name}: {got!r}")
+        if not ok:
+            failures += 1
+            print(f"     expected: {expected!r}")
+
+    # The genuine wrapper call above must still parse to a real call after the strip.
+    _genuine = markup_cases[-1][1]
+    _g_calls, _ = extract_tool_calls(_genuine)
+    ok = bool(_g_calls) and _g_calls[0]["function"]["name"] == "read_file"
+    print(f"{'ok  ' if ok else 'FAIL'} markup repetition keeps a genuine call parseable: {_g_calls}")
+    if not ok:
+        failures += 1
+
     # A `tool_calls` finish reason that yielded no call is downgraded, in both the
     # streaming and the buffered path, so the client does not abort the turn.
     downgrade_cases = [
@@ -3016,6 +3160,8 @@ def _selftest() -> int:
         + 1
         + len(hoist_cases)
         + len(repetition_cases)
+        + len(markup_cases)
+        + 1
         + len(downgrade_cases)
         + len(glyph_cases)
         + 2

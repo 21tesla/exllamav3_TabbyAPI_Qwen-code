@@ -460,6 +460,30 @@ upstream 500 drives this model into a loop, it will loop again and the answer fo
 still the truncated prose. The turn now survives and says so, which is the part the client could
 not do for itself.
 
+**The same loop in the wrong glyphs — `_strip_markup_repetition`.** A second, wider instance of this
+loop was captured live on 2026-09-27 (session `e5e8c7f9`, same project): at long context the model
+collapsed into a run of *bare wrong-glyph wrapper openers* — `<|DSML|>`, the U+FF5C form (§2.12) —
+with no `tool_calls`, no `name` and no arguments. It widened as context grew: **98** openers at
+`00:36`, **178** after a nudge, **266** after a `/compact` re-grew the context, the last a pure
+delimiter run with nothing between the openers but a newline. `_strip_repetition_tail` could not see
+any of it, because `_strip_tool_call_openers` matches only `<tool_call>`, and the loop is the wrong
+*glyph*.
+
+`_strip_markup_repetition` closes it. It finds the longest consecutive chain of bare openers whose
+gaps hold neither a nearer (`</`) nor the keyword `tool_calls`, then rebuilds the text keeping each
+**distinct** span of prose once — the gaps between openers plus the text after the last one — and
+drops a partial trailing opener (`<|DSML|`, no `>`) left by the token cut. The de-duplication is what
+turns a run that repeats one intent sentence 24 times into that sentence once. Two guards keep it off
+real calls: a `</` or a `tool_calls` between openers ends the chain, so a genuine wrong-glyph call is
+left intact for §2.12's recovery (verified — it still parses to a real call), and only runs of **two
+or more** openers are touched, so a lone opener still reaches the DSML parser. Measured: 4 773 → 1 101
+chars (98 openers, loose loop) and 2 526 → 124 chars (266, pure run), both to zero openers.
+
+This is the same defect as §14.5's nine unclosed openers in `SPECIFIC.md`, caught at nine and again
+at 266 — the run grows with context and the delimiters drift. Like the `<tool_call>` case it removes
+the loop, not the cause: it makes each occurrence a readable turn instead of a markup wall, and the
+session still needs a `/compact` or restart when the loop recurs.
+
 ### 2.12 A tool call written in the wrong glyphs
 
 Past roughly **180 k tokens of context** this checkpoint starts losing ASCII: it writes the
@@ -964,6 +988,7 @@ Each of these actually happened, and each is now handled or documented.
 | session halts with `malformed tool call`, `Expecting ',' delimiter` | the model closed a JSON string early on an unescaped `"`; the quote is indistinguishable from a real delimiter, so repair would be guesswork | injected tool instructions now spell out `\"` / `\n` escaping (§2.10) |
 | a call vanishes with no error at all | the model emitted a name the request never declared (`comment_end` and friends) | proxy now warns that the client cannot dispatch it, and can dump the raw payload (§2.8) |
 | the session stops with `Model response contained a malformed tool call.` over pure tag noise | the model repeated empty `<tool_call>` openers after an upstream `500`; the proxy passed that on as `finish_reason: "tool_calls"` with no call, which the client aborts on | the run is dropped and the finish reason downgraded to `stop`; stop sequences end the loop at the source (§2.11) |
+| the turn ends as a 10 KB wall of repeated wrong-glyph DSML delimiters | at long context the model collapsed into a repetition loop of bare wrong-glyph wrapper openers (98 → 178 → 266 as context grew, measured live 2026-09-27), emitting no call | `_strip_markup_repetition` collapses the run and keeps each distinct span of prose once; a genuine wrong-glyph call is left for the glyph recovery (§2.11) |
 
 ---
 

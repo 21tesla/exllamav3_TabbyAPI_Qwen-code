@@ -1175,7 +1175,8 @@ no abort**. The cost is an idle session awaiting a nudge, not a lost turn.
 Open, and not fixed: whether a mid-text repetition run of *delimiters* should be collapsed so the
 client renders an end-of-turn instead of a 10 KB wall. The prose between the delimiters is real text
 the model wrote, so a naive collapse would discard content; the delimiters alone are safe to drop but
-are also the only signal that distinguishes this collapse from ordinary prose. Recorded as open.
+are also the only signal that distinguishes this collapse from ordinary prose. **Now fixed — see the
+close of this section.**
 
 **The collapse reproduces on resume, and widens.** A cross-session nudge ("continue the item (6)
 work") was delivered at `00:47:20`; the session woke (GPU 97%) and the very next completion collapsed
@@ -1209,4 +1210,48 @@ same task, emits clean calls at small context and collapses at large. Compaction
 Running tally of `[WARNING]` on the deployed build: 6 for the two pre-compact collapses, 3 for the
 benign compaction-summary false positive, 3 for the third collapse — 12 total, fabrication detector
 0, `SyntaxWarning` 0 throughout.
+
+**The fix — `_strip_markup_repetition`, wired into `_strip_repetition_tail`.** The 2026-09-26
+`<tool_call>` loop was already handled by `_strip_tool_call_openers`, but that strip only knows
+`<tool_call>`, and it only removes a *trailing* run, so it could not see the wrong-glyph wrapper. The
+new pass collapses a run of bare wrong-glyph openers (`<|DSML|>`, ASCII `|` **and** U+FF5C,
+case-insensitive `DSML`): it finds the longest consecutive chain of openers whose gaps hold neither a
+nearer (`</`) nor the keyword `tool_calls`, then rebuilds the text with each **distinct** span of
+prose kept **once** — the gaps between openers plus the tail after the last one — and drops a partial
+trailing opener (`<|DSML|`, no `>`) left by the token cut. Only runs of **two or more** openers are
+touched: a lone opener is real markup and must still reach `parse_dsml_tool_calls`.
+
+The two guards are what keep it from eating real calls. A `</` or a `tool_calls` between two openers
+ends the chain, so a genuine wrong-glyph call
+(`<|DSML|tool_calls>…<|DSML|tool name="read_file">…</|DSML|tool>`) is left entirely intact for
+`34eb6d5`'s recovery, which is the path that can actually dispatch it — verified: that call still
+parses to `read_file` after the strip. And an opener with any real text after it (not another opener)
+is not a run, so it is untouched. The result turns the degenerate wall into the readable prose the
+model actually wrote: instance 1 (98 openers, loose loop) 4 773 → 1 101 chars, instance 3 (266
+openers, pure run) 2 526 → 124 chars, both to 0 openers. Self-test **115/115** (8 new cases: pure
+run, dedup'd intent, partial tail, lone opener, ASCII-bar form, two-opener minimum, real-text
+guard, genuine-call guard, plus the parse check). This is the fix for §14.5(4) as well — that gap
+was the same defect at nine openers, before the glyphs drifted.
+
+Note the *remedy* and the *mitigation* are different layers. Compaction resets the context and buys
+a window of clean calls; this strip does not touch the cause (long-context emission degradation) at
+all — it only stops a degenerate completion reaching the client as a 10 KB markup wall, so the turn
+ends as prose the user can read and re-prompt from. The session still needs a rescue when the loop
+recurs; the strip just makes each occurrence cost a readable turn instead of a wall.
+
+**The clean turns after the third collapse did not come from this model — the session switched
+providers.** After the `04:52:58Z` collapse the transcript goes quiet through the proxy but is far
+from idle: it records 27 clean turns between `04:56:16Z` and `04:58:30Z`, every one a real
+`read_file`/`grep_search`/`glob` call, with **no** POST reaching `:8081` and no interception line
+(the proxy's POST count is frozen at 38, its last entry the collapse itself). The cause is a model
+switch, not a proxy fault: every assistant record on those turns names `deepseek-v4.1-flash:cloud`,
+whereas every earlier record named `DeepSeek-V4-Flash-0731-exl3-2.32bpw` — the switch lands exactly at
+`04:56:16.968Z`, the first clean turn. The two names resolve to different `modelProviders` entries in
+`~/.qwen/settings.json`: the TabbyAPI/ExLlama model points at `http://127.0.0.1:8081/v1` (this
+proxy), the cloud model at `http://127.0.0.1:11434/v1` (Ollama), so those turns never left the host's
+loopback via the proxy at all. The probe therefore stopped exercising `DeepSeek-V4-Flash` at the third
+collapse; the clean turns are a *different* model answering, and the collapse width sequence
+(98 → 178 → 266) remains the last measurement of this checkpoint. This also settles the question that
+opened the section's monitoring: a run of proxy-silent turns is not necessarily a broken interception
+path — check the `model` field of the assistant records first.
 
